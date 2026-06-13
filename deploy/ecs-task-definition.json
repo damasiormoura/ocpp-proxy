@@ -1,0 +1,133 @@
+{
+  "family": "ocpp-proxy",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ocpp-proxy-execution-role",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ocpp-proxy-task-role",
+  "containerDefinitions": [
+    {
+      "name": "ocpp-proxy",
+      "image": "ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/ocpp-proxy:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 9000,
+          "hostPort": 9000,
+          "protocol": "tcp",
+          "name": "websocket"
+        },
+        {
+          "containerPort": 8080,
+          "hostPort": 8080,
+          "protocol": "tcp",
+          "name": "health-check"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
+        "interval": 10,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "environment": [
+        {
+          "name": "OCPP_PROXY_CENTRAL_SYSTEM_URL",
+          "value": "wss://mobi-e.example.com/ocpp/v16"
+        },
+        {
+          "name": "OCPP_PROXY_LISTEN_PORT",
+          "value": "9000"
+        },
+        {
+          "name": "OCPP_PROXY_HEALTH_PORT",
+          "value": "8080"
+        },
+        {
+          "name": "OCPP_PROXY_MQTT__HOST",
+          "value": "mqtt.your-home-domain.com"
+        },
+        {
+          "name": "OCPP_PROXY_MQTT__PORT",
+          "value": "8883"
+        },
+        {
+          "name": "OCPP_PROXY_MQTT__CA_CERT_PATH",
+          "value": "/certs/mqtt/ca.pem"
+        },
+        {
+          "name": "OCPP_PROXY_MQTT__CLIENT_CERT_PATH",
+          "value": "/certs/mqtt/client.pem"
+        },
+        {
+          "name": "OCPP_PROXY_MQTT__CLIENT_KEY_PATH",
+          "value": "/certs/mqtt/client-key.pem"
+        },
+        {
+          "name": "OCPP_PROXY_LOGGING__LEVEL",
+          "value": "INFO"
+        },
+        {
+          "name": "OCPP_PROXY_BUFFERS__MESSAGE_BUFFER_SIZE",
+          "value": "100"
+        },
+        {
+          "name": "OCPP_PROXY_BUFFERS__MQTT_BUFFER_SIZE",
+          "value": "500"
+        },
+        {
+          "name": "OCPP_PROXY_BUFFERS__MAX_BACKOFF_SECONDS",
+          "value": "60"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "OCPP_PROXY_MQTT__USERNAME",
+          "valueFrom": "arn:aws:secretsmanager:eu-west-1:ACCOUNT_ID:secret:ocpp-proxy/mqtt-credentials:username::"
+        },
+        {
+          "name": "OCPP_PROXY_MQTT__PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:eu-west-1:ACCOUNT_ID:secret:ocpp-proxy/mqtt-credentials:password::"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/ocpp-proxy",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "proxy",
+          "awslogs-create-group": "true"
+        }
+      },
+      "mountPoints": [
+        {
+          "sourceVolume": "mqtt-certs",
+          "containerPath": "/certs/mqtt",
+          "readOnly": true
+        }
+      ]
+    }
+  ],
+  "volumes": [
+    {
+      "name": "mqtt-certs",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-EXAMPLE_EFS_ID",
+        "rootDirectory": "/ocpp-proxy/certs",
+        "transitEncryption": "ENABLED"
+      }
+    }
+  ],
+  "tags": [
+    {
+      "key": "Project",
+      "value": "ocpp-proxy"
+    },
+    {
+      "key": "Environment",
+      "value": "production"
+    }
+  ]
+}

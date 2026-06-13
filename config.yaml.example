@@ -1,0 +1,100 @@
+# ==============================================================================
+# OCPP Proxy Configuration
+# ==============================================================================
+#
+# This file documents all configuration parameters for the OCPP Proxy.
+#
+# Configuration layering (highest precedence first):
+#   1. Environment variables with prefix OCPP_PROXY_ (use __ for nesting)
+#   2. YAML file at CONFIG_FILE_PATH env var, or ./config.yaml if not set
+#
+# Environment variable examples:
+#   OCPP_PROXY_CENTRAL_SYSTEM_URL=wss://mobi-e.example.com/ocpp/v16
+#   OCPP_PROXY_LISTEN_PORT=9000
+#   OCPP_PROXY_HEALTH_PORT=8080
+#   OCPP_PROXY_MQTT__HOST=mqtt.example.com
+#   OCPP_PROXY_MQTT__PORT=8883
+#   OCPP_PROXY_MQTT__USERNAME=ocpp_proxy
+#   OCPP_PROXY_MQTT__PASSWORD=secret
+#   OCPP_PROXY_MQTT__CA_CERT_PATH=/certs/ca.pem
+#   OCPP_PROXY_MQTT__CLIENT_CERT_PATH=/certs/client.pem
+#   OCPP_PROXY_MQTT__CLIENT_KEY_PATH=/certs/client-key.pem
+#   OCPP_PROXY_LOGGING__LEVEL=INFO
+#   OCPP_PROXY_BUFFERS__MESSAGE_BUFFER_SIZE=100
+#   OCPP_PROXY_BUFFERS__MQTT_BUFFER_SIZE=500
+#   OCPP_PROXY_BUFFERS__MAX_BACKOFF_SECONDS=60
+#
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# REQUIRED: Central System (Mobi.e) WebSocket URL
+# ------------------------------------------------------------------------------
+# The WebSocket URL of the OCPP 1.6J Central System.
+# Must use ws:// or wss:// scheme.
+# The Charge Point ID from the charger connection will be appended to this path.
+central_system_url: "wss://mobi-e.example.com/ocpp/v16"
+
+# ------------------------------------------------------------------------------
+# REQUIRED: WebSocket Listen Port
+# ------------------------------------------------------------------------------
+# Port on which the proxy listens for incoming charger WebSocket connections.
+# Valid range: 1-65535
+listen_port: 9000
+
+# ------------------------------------------------------------------------------
+# OPTIONAL: Health Check Port (default: 8080)
+# ------------------------------------------------------------------------------
+# Port for the HTTP health check endpoint (/health).
+# Used by AWS ECS/NLB health checks and monitoring tools.
+# Valid range: 1-65535
+health_port: 8080
+
+# ------------------------------------------------------------------------------
+# REQUIRED: MQTT Broker Configuration
+# ------------------------------------------------------------------------------
+mqtt:
+  # Hostname or IP of the MQTT broker (Mosquitto on Raspberry Pi)
+  host: "mqtt.example.com"
+
+  # MQTT broker port (typically 8883 for MQTTS)
+  # Valid range: 1-65535
+  port: 8883
+
+  # MQTT authentication credentials
+  # In production, use AWS Secrets Manager or environment variables instead
+  username: "ocpp_proxy"
+  password: "your-secure-password-here"
+
+  # TLS certificate paths for secure MQTT connection
+  # All three are required for mutual TLS authentication
+  ca_cert_path: "/certs/mqtt/ca.pem"
+  client_cert_path: "/certs/mqtt/client.pem"
+  client_key_path: "/certs/mqtt/client-key.pem"
+
+# ------------------------------------------------------------------------------
+# OPTIONAL: Logging Configuration
+# ------------------------------------------------------------------------------
+logging:
+  # Log level: DEBUG, INFO, WARNING, or ERROR
+  # Default: INFO
+  # Logs are output as structured JSON to stdout
+  level: "INFO"
+
+# ------------------------------------------------------------------------------
+# OPTIONAL: Buffer and Backoff Configuration
+# ------------------------------------------------------------------------------
+buffers:
+  # Maximum number of OCPP messages buffered when upstream/downstream is
+  # disconnected. Oldest messages are discarded (FIFO) when the limit is reached.
+  # Default: 100
+  message_buffer_size: 100
+
+  # Maximum number of MQTT messages buffered when the MQTT broker is unreachable.
+  # Oldest messages are discarded (FIFO) when the limit is reached.
+  # Default: 500
+  mqtt_buffer_size: 500
+
+  # Maximum reconnection backoff interval in seconds for WebSocket connections.
+  # Exponential backoff starts at 2s and doubles until this maximum.
+  # Default: 60
+  max_backoff_seconds: 60
