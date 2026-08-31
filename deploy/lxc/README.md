@@ -43,7 +43,42 @@ config files:
 |---|---|
 | Dongle subnet and gateway | **Resolved 2026-08-31.** `192.168.0.0/24`, gateway `192.168.0.1`, DHCP offers `.169`. Modem reports LTE, full signal, `ppp_connected`, operator NOS. Confirm the DHCP pool range in the dongle UI and move the static address outside it if `.169` falls inside. |
 | Mobi.e endpoint | **Resolved.** `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058`, read from the charger's own OCPP configuration. Charge Point ID `MOBI-ALM-00058`; the proxy is configured with the base `ws://10.200.10.200/ocpp/1.6` and appends the ID. |
-| Charger address | **Still blocking.** The charger has not appeared on either network — no DHCP lease and no ARP entry on `192.168.51.0/24` or `192.168.50.0/24`. |
+| Charger address | **Still blocking.** MAC `18:d7:93:60:b6:19` is absent from both networks at every layer — see below. |
+
+### Charger: what is known, 2026-08-31
+
+The charger is **not reachable on either network**, established at layer 2, not
+inferred from a failed ping:
+
+| Check | Result |
+|---|---|
+| DHCP lease, either router | none |
+| ARP sweep, all 254 hosts on `192.168.51.0/24` | 27 responders, all known IoT devices |
+| ARP sweep, all 254 hosts on `192.168.50.0/24` | MAC not present |
+| IoT bridge MAC table | 37 entries, all accounted for; no `18:d7:93` |
+| Main bridge MAC table | no `18:d7:93` |
+| 60 s packet capture on the IoT segment | nothing from that MAC (capture proven working by control) |
+
+Its only trace anywhere is an **incomplete** ARP entry for `192.168.50.59` on
+the main router — the record of a failed lookup, not a live host. With no DHCP
+lease on either router, that points to the charger being statically configured
+at `192.168.50.59` from its original setup.
+
+The powerline path itself is fine: the TL-WPA4220 holds `192.168.51.209` and
+was observed ARPing on the segment. So the bridge works and the charger is not
+reaching it — most likely an Ethernet link that is not actually up, a disabled
+LAN interface on the charger, or the charger's comms module being off.
+
+**When it does come up it will need reconfiguring, not just plugging in.** A
+static `192.168.50.59` cannot work on the `192.168.51.0/24` segment. It needs
+either DHCP from the spare BD4 (simplest — it supplies the gateway
+automatically) or a static address in `192.168.51.0/24` **with gateway
+`192.168.51.1`**. The gateway matters: the proxy is on a different subnet
+(`192.168.52.30`), so without a default route the charger cannot reach it.
+
+The path is verified working ahead of the charger's arrival — from the IoT
+segment, `192.168.52.1` and HA at `192.168.52.144` both answer in 2–4 ms,
+comfortably inside the 100 ms forwarding budget of Requirement 3.
 
 ### The APN is a closed network — measured, not assumed
 
