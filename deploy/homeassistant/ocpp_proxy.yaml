@@ -20,6 +20,13 @@
 #
 # MeterValues does NOT always carry transactionId — observed both with and
 # without on the same charger — so nothing may depend on it being present.
+#
+# Entity IDs: because these sensors declare a `device:`, Home Assistant builds
+# each entity_id from the device name plus the sensor name, giving
+# `sensor.ev_charger_mobi_alm_00058_charger_power` rather than
+# `sensor.charger_power`. The template sensors and the dashboard reference the
+# full IDs accordingly. Renaming them afterwards in the UI does not change the
+# unique_id, so the dashboard would need updating to match if you do.
 # ---------------------------------------------------------------------------
 
 mqtt:
@@ -226,15 +233,15 @@ template:
         state_class: total_increasing
         unit_of_measurement: "kWh"
         availability: >-
-          {{ states('sensor.charger_energy_meter') not in ['unknown', 'unavailable', 'none']
-             and states('sensor.charger_session_meter_start') not in ['unknown', 'unavailable', 'none'] }}
+          {{ states('sensor.ev_charger_mobi_alm_00058_charger_energy_meter') not in ['unknown', 'unavailable', 'none']
+             and states('sensor.ev_charger_mobi_alm_00058_charger_session_meter_start') not in ['unknown', 'unavailable', 'none'] }}
         state: >-
-          {% set now_kwh = states('sensor.charger_energy_meter') | float(0) %}
-          {% set start_kwh = states('sensor.charger_session_meter_start') | float(0) %}
+          {% set now_kwh = states('sensor.ev_charger_mobi_alm_00058_charger_energy_meter') | float(0) %}
+          {% set start_kwh = states('sensor.ev_charger_mobi_alm_00058_charger_session_meter_start') | float(0) %}
           {{ [now_kwh - start_kwh, 0] | max | round(3) }}
 
       - name: "Charger Charging"
         unique_id: ocpp_charger_is_charging
         icon: mdi:flash
         state: >-
-          {{ 'on' if states('sensor.charger_status') == 'Charging' else 'off' }}
+          {{ 'on' if states('sensor.ev_charger_mobi_alm_00058_charger_status') == 'Charging' else 'off' }}

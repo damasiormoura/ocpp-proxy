@@ -17,7 +17,7 @@ views:
       # ---------------------------------------------------------------
       - type: conditional
         conditions:
-          - entity: binary_sensor.ocpp_proxy_online
+          - entity: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
             state: "off"
         card:
           type: markdown
@@ -31,16 +31,24 @@ views:
             Check `LXC 113` on the Proxmox host:
             `systemctl status ocpp-proxy`
 
+      # Conditions are ANDed. All three are needed: `state_not: NoError` alone
+      # also matches `unknown` and `unavailable`, which is not a fault — it
+      # just means no StatusNotification has arrived since Home Assistant
+      # restarted, because that topic is not retained.
       - type: conditional
         conditions:
-          - entity: sensor.charger_error_code
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_error_code
             state_not: "NoError"
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_error_code
+            state_not: "unknown"
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_error_code
+            state_not: "unavailable"
         card:
           type: markdown
           content: >
-            ## ⚠️ Charger reports {{ states('sensor.charger_error_code') }}
+            ## ⚠️ Charger reports {{ states('sensor.ev_charger_mobi_alm_00058_charger_error_code') }}
 
-            Status: {{ states('sensor.charger_status') }}
+            Status: {{ states('sensor.ev_charger_mobi_alm_00058_charger_status') }}
 
       # ---------------------------------------------------------------
       # At a glance
@@ -49,13 +57,13 @@ views:
         title: Status
         columns: 4
         entities:
-          - entity: sensor.charger_status
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_status
             name: Charger
-          - entity: binary_sensor.ocpp_proxy_online
+          - entity: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
             name: Proxy
-          - entity: sensor.ocpp_proxy_upstream
+          - entity: sensor.ev_charger_mobi_alm_00058_ocpp_proxy_upstream
             name: Mobi.e
-          - entity: sensor.charger_transaction_id
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_transaction_id
             name: Transaction
 
       # ---------------------------------------------------------------
@@ -64,7 +72,7 @@ views:
       - type: horizontal-stack
         cards:
           - type: gauge
-            entity: sensor.charger_power
+            entity: sensor.ev_charger_mobi_alm_00058_charger_power
             name: Power
             unit: W
             min: 0
@@ -74,7 +82,7 @@ views:
               yellow: 7000
               red: 7300
           - type: gauge
-            entity: sensor.charger_current_l1
+            entity: sensor.ev_charger_mobi_alm_00058_charger_current_l1
             name: Current L1
             unit: A
             min: 0
@@ -84,6 +92,21 @@ views:
               yellow: 30
               red: 31
 
+      # StatusNotification / StartTransaction are event topics and are not
+      # retained, so these read "unknown" after a Home Assistant restart until
+      # the charger next changes state. The markdown card below says so rather
+      # than leaving a wall of "Unknown" looking like a fault.
+      - type: conditional
+        conditions:
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_status
+            state: "unknown"
+        card:
+          type: markdown
+          content: >
+            *Waiting for the charger's next status update — these fields fill
+            in when it next changes state or starts a transaction. Live power
+            and energy above are unaffected.*
+
       - type: entities
         title: This session
         state_color: true
@@ -91,16 +114,16 @@ views:
           - entity: sensor.charger_session_energy
             name: Energy delivered
             icon: mdi:lightning-bolt
-          - entity: sensor.charger_session_meter_start
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_session_meter_start
             name: Meter at start
-          - entity: sensor.charger_energy_meter
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_energy_meter
             name: Meter now
-          - entity: sensor.charger_transaction_id
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_transaction_id
             name: Transaction ID
-          - entity: sensor.charger_authorization
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_authorization
             name: Last authorisation
           - type: divider
-          - entity: sensor.charger_last_session_energy
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_last_session_energy
             name: Previous session meter stop
 
       # ---------------------------------------------------------------
@@ -110,16 +133,16 @@ views:
         title: Power (last 6 hours)
         hours_to_show: 6
         entities:
-          - entity: sensor.charger_power
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
             name: Power
 
       - type: history-graph
         title: Charger state
         hours_to_show: 24
         entities:
-          - entity: sensor.charger_status
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_status
             name: Status
-          - entity: binary_sensor.ocpp_proxy_online
+          - entity: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
             name: Proxy online
 
       - type: statistics-graph
@@ -130,7 +153,7 @@ views:
         stat_types:
           - change
         entities:
-          - sensor.charger_energy_meter
+          - sensor.ev_charger_mobi_alm_00058_charger_energy_meter
 
       # ---------------------------------------------------------------
       # Electrical detail — collapsed by default, rarely needed
@@ -138,21 +161,21 @@ views:
       - type: entities
         title: Electrical
         entities:
-          - entity: sensor.charger_voltage_l1
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_voltage_l1
             name: Voltage L1
-          - entity: sensor.charger_current_l1
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_current_l1
             name: Current L1
-          - entity: sensor.charger_power
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
             name: Active power
 
       - type: entities
         title: Proxy link
         entities:
-          - entity: binary_sensor.ocpp_proxy_online
+          - entity: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
             name: Proxy process
-          - entity: sensor.ocpp_proxy_upstream
+          - entity: sensor.ev_charger_mobi_alm_00058_ocpp_proxy_upstream
             name: Upstream to Mobi.e
-          - entity: sensor.ocpp_proxy_downstream
+          - entity: sensor.ev_charger_mobi_alm_00058_ocpp_proxy_downstream
             name: Downstream to charger
-          - entity: sensor.charger_error_code
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_error_code
             name: Charger error code
