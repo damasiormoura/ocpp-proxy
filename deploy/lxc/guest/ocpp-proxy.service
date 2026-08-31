@@ -1,9 +1,14 @@
 [Unit]
 Description=OCPP 1.6J proxy — Autel charger to Mobi.e, with MQTT for Home Assistant
 Documentation=https://github.com/damasiormoura/ocpp-proxy
-After=network-online.target ocpp-wwan-policy.service
-Wants=network-online.target
-Requires=ocpp-wwan-policy.service
+After=network-online.target ocpp-routes.service
+Wants=network-online.target ocpp-routes.service
+
+# Wants, not Requires. If the routes fail the proxy still starts, reports
+# itself unhealthy and publishes that over MQTT, which is a louder signal than
+# a systemd unit sitting inactive with nobody watching it. It also keeps the
+# charger's connection being accepted, so the failure is visible where it
+# happens rather than as a refused connection.
 
 [Service]
 Type=simple

@@ -15,6 +15,16 @@
 # security boundary. 10.200.10.0/24 collides with nothing on this network.
 central_system_url: "ws://10.200.10.200/ocpp/1.6"
 
+# Charge Point ID, used for the MQTT Last Will and Testament topic
+# (ocpp/{id}/availability). It must be configured here rather than taken from
+# the charger's connection, because the will has to be registered in the MQTT
+# CONNECT packet — before any charger has connected to tell us its ID.
+#
+# Without it there is no Last Will, and nothing tells Home Assistant when this
+# proxy dies unexpectedly. That is the only signal it gets: no orchestrator is
+# watching this process.
+charge_point_id: "MOBI-ALM-00058"
+
 # Not needed now that the Central System is a fixed private address: egress is
 # selected by a destination route for 10.200.10.0/24 in both the container and
 # the host, which is simpler than policy rules in two places. Kept available as

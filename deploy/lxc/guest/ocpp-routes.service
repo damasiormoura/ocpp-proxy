@@ -1,5 +1,5 @@
 [Unit]
-Description=Policy route the OCPP proxy's Mobi.e traffic over the host's WWAN link
+Description=Static routes the OCPP proxy needs on its two gateway-less legs
 Before=ocpp-proxy.service
 After=network-online.target
 Wants=network-online.target
@@ -20,12 +20,28 @@ Wants=network-online.target
 # endpoint is a fixed private range. That keeps the app out of it entirely —
 # no bind-address configuration, and nothing to keep in sync between the two
 # halves except one prefix.
+#
+# The second route is the charger's return path, and it is easy to miss
+# because the charger dials in rather than being dialled. Inbound works
+# without it — the spare router already routes 192.168.52.0/24 here — but the
+# proxy's replies would leave via its LAN default route to 192.168.50.1, which
+# knows nothing of 192.168.51.0/24. The connection would half-open and fail
+# asymmetrically. Home Assistant and Frigate get this route from the host's
+# dnsmasq via DHCP option 121; this container has a static address, so it does
+# not, and must be told explicitly.
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/sbin/ip route replace 10.200.10.0/24 via 10.80.0.1 dev eth1
+ExecStart=/usr/local/sbin/ocpp-routes.sh
 ExecStop=/bin/sh -c 'ip route del 10.200.10.0/24 2>/dev/null || true'
+ExecStop=/bin/sh -c 'ip route del 192.168.51.0/24 2>/dev/null || true'
+
+# The script already waits for each next hop, but a container that comes back
+# with networking genuinely broken should keep trying rather than give up
+# after one attempt at boot.
+Restart=on-failure
+RestartSec=15s
 
 [Install]
 WantedBy=multi-user.target

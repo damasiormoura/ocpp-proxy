@@ -305,7 +305,10 @@ default route.
 No `nesting=1`, no `keyctl=1`, and no device passthrough — this container runs
 a bare binary, not Docker, and never touches the USB device.
 
-## Step 5 — Container-side policy routing
+> **Deployed and verified 2026-08-31.** LXC 113 is running this. Everything
+> below has been executed once; the notes record what the first run found.
+
+## Step 5 — Container-side routing
 
 **This is the step most easily missed, and it fails in a misleading way.**
 
@@ -321,10 +324,26 @@ is sent to the host across `vmbr2`, and on the host (Step 2) so the host
 forwards it out `wwan0` rather than back to the LAN.
 
 ```bash
-scp guest/ocpp-wwan-policy.service proxmox:/tmp/
-ssh proxmox 'pct push 113 /tmp/ocpp-wwan-policy.service /etc/systemd/system/ocpp-wwan-policy.service
+scp guest/ocpp-routes.sh guest/ocpp-routes.service proxmox:/tmp/
+ssh proxmox 'pct push 113 /tmp/ocpp-routes.sh /usr/local/sbin/ocpp-routes.sh --perms 755
+             pct push 113 /tmp/ocpp-routes.service /etc/systemd/system/ocpp-routes.service
              pct exec 113 -- systemctl daemon-reload
-             pct exec 113 -- systemctl enable --now ocpp-wwan-policy'
+             pct exec 113 -- systemctl enable --now ocpp-routes'
+
+**Two routes, and the second is the one that gets forgotten.** The charger's
+return route (`192.168.51.0/24 via 192.168.52.1`) is easy to miss because the
+charger dials in rather than being dialled: inbound already works without it,
+since the spare router routes `192.168.52.0/24` here. Only the proxy's replies
+go astray, out the LAN default route to a router that knows nothing of
+`192.168.51.0/24`. Home Assistant and Frigate receive this route by DHCP option
+121 from the host's dnsmasq; this container has a static address and does not.
+
+**The routes are installed by a script that waits for each next hop.** At
+container boot `network-online.target` is reached before Proxmox has applied
+addresses to `eth1`/`eth2`, and `ip route replace ... via` fails with
+`Nexthop has invalid gateway`. A first reboot test caught exactly this: the
+container came back with no routes and no proxy. Measured on the retry, the
+next hop becomes routable about a second after the unit first runs.
 ```
 
 `ocpp-proxy.service` declares `Requires=` and `After=` on this unit, so the
@@ -333,9 +352,12 @@ proxy cannot start with the route missing.
 Verify from inside the container:
 
 ```bash
-ssh proxmox 'pct exec 113 -- ip rule show | grep 10.80.0.2
-             pct exec 113 -- ip route show table 100'
+ssh proxmox 'pct exec 113 -- ip route | grep -E "10.200.10|192.168.51"'
 ```
+
+Both routes must be present. The charger's return route is the one that is
+easy to miss, because the charger dials in rather than being dialled: inbound
+succeeds without it and only the replies go astray.
 
 ## Step 6 — Restrict who can reach the charger port
 
@@ -428,6 +450,21 @@ A health status of `idle` with HTTP 200 when no car is plugged in is **correct**
 The previous ECS design reported that state as `unhealthy`/503, which combined
 with a restart-on-three-failures health check would have restarted the container
 forever whenever nobody was charging.
+
+## Verified on the deployed container, 2026-08-31
+
+| Check | Result |
+|---|---|
+| `/health`, no charger connected | `{"status":"idle",...}` HTTP **200** — the restart loop is closed |
+| Charger listener | bound to `192.168.52.30:9000` only |
+| Non-`ocpp1.6` subprotocol | HTTP 400 |
+| Simulated charger connects | `101 Switching Protocols`, `ocpp1.6` negotiated |
+| Upstream established through the APN | `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058` in **284 ms** |
+| `/health` with a charger attached | `{"status":"healthy","upstream":"connected","mqtt":"connected"}` |
+| MQTT retained topics | `ocpp/MOBI-ALM-00058/availability` = `online`, `.../status` tracking both legs |
+| `kill -9` the process | systemd restarted it, `NRestarts=1` |
+| Container reboot | routes, proxy, MQTT and the full chain all return unattended |
+| Proxy stopped | Last Will published `availability` = `offline` |
 
 ## Manual bypass
 
