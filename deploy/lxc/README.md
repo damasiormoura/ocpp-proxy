@@ -20,9 +20,11 @@ obvious.
 |---|---|
 | Guest | LXC 113 `ocpp-proxy`, unprivileged, `onboot: 1` |
 | Resources | 1 vCPU / 512 MB / 8 GB |
-| LAN address | `192.168.50.28/24` on `vmbr0`, gw `192.168.50.1` |
+| LAN address | `192.168.50.28/24` on `vmbr0`, gw `192.168.50.1` — MQTT and admin only |
+| Charger-facing address | `192.168.52.30/24` on `vmbr1`, no gateway |
 | WWAN egress address | `10.80.0.2/30` on `vmbr2`, no gateway |
-| Charger port | `9000` on the LAN address only |
+| Charger port | `9000` on the `vmbr1` address only |
+| Charger network | `192.168.51.0/24` (IoT), via the TL-WPA4220 powerline AP |
 | Health port | `8080` |
 | MQTT broker | `192.168.50.167:1883` (Mosquitto on VM 110) |
 | Host WWAN interface | `wwan0` (ZTE `19d2:1405`, `cdc_ether`) |
@@ -37,10 +39,36 @@ that they stay in sync.
 Two must be filled in before this works, both marked `__PLACEHOLDER__` in the
 config files:
 
-| Placeholder | How to obtain |
+| Item | Status |
 |---|---|
-| `__WWAN_ADDR__`, `__WWAN_GW__` | Insert the SIM, set the APN in the dongle's web UI, then `ip link set wwan0 up && dhclient -v wwan0 && ip -4 a show wwan0 && ip r`. Note the subnet and gateway, `dhclient -r wwan0`, then hard-code them. |
-| `__MOBIE_HOST__` | The WebSocket URL Mobi.e issued for this charge point. Also confirm whether its hostname resolves publicly or only via the APN's DNS. |
+| Dongle subnet and gateway | **Resolved 2026-08-31.** `192.168.0.0/24`, gateway `192.168.0.1`, DHCP offers `.169`. Modem reports LTE, full signal, `ppp_connected`, operator NOS. Confirm the DHCP pool range in the dongle UI and move the static address outside it if `.169` falls inside. |
+| `__MOBIE_HOST__` | **Still blocking.** The WebSocket URL Mobi.e issued for this charge point. Read it out of the charger's current OCPP configuration. |
+| Charger address | **Still blocking.** The charger has not appeared on either network — no DHCP lease and no ARP entry on `192.168.51.0/24` or `192.168.50.0/24`. |
+
+### The APN is a closed network — measured, not assumed
+
+Verified 2026-08-31 while the modem reported a healthy connected LTE session:
+
+| Test | Result |
+|---|---|
+| Dongle gateway `192.168.0.1` | reachable, 0.8 ms |
+| ICMP to `1.1.1.1` | 100% loss |
+| TCP to `http://example.com` | no connection |
+| DNS to `192.168.0.1:53` | timeout — the dongle does not proxy DNS |
+| DNS to `8.8.8.8` | timeout |
+| DNS server in the DHCP lease | none offered |
+
+This is a private APN behaving correctly, **not a fault**. Two consequences
+that shape the deployment:
+
+1. **Name resolution and transport take different paths.** The proxy resolves
+   the Mobi.e hostname through the LXC's LAN resolver, then connects over the
+   APN. If the name does not resolve publicly, or resolves to an address not
+   reachable inside the APN, the endpoint must be configured by IP — there is
+   no DNS on the mobile path to fall back on.
+2. **Never health-check the WWAN path against a public host.** No public host
+   is reachable. `PROBE_HOST` in `/etc/default/ocpp-wwan` must be the Mobi.e
+   endpoint or left empty.
 
 ## Step 1 — Host: pin the dongle's name
 
@@ -99,7 +127,7 @@ scp host/wwan-watchdog.sh            proxmox:/usr/local/sbin/
 scp host/ocpp-wwan-watchdog.service  proxmox:/etc/systemd/system/
 scp host/ocpp-wwan-watchdog.timer    proxmox:/etc/systemd/system/
 ssh proxmox 'chmod 750 /usr/local/sbin/wwan-watchdog.sh'
-ssh proxmox 'printf "WWAN_GW=__WWAN_GW__\nPROBE_HOST=\n" > /etc/default/ocpp-wwan'
+ssh proxmox 'printf "WWAN_GW=192.168.0.1\nPROBE_HOST=\n" > /etc/default/ocpp-wwan'
 ssh proxmox 'systemctl daemon-reload && systemctl enable --now ocpp-wwan-watchdog.timer'
 ```
 
@@ -118,20 +146,66 @@ ssh proxmox 'pct create 113 local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst
   --rootfs local-lvm:8 \
   --net0 name=eth0,bridge=vmbr0,ip=192.168.50.28/24,gw=192.168.50.1,firewall=1 \
   --net1 name=eth1,bridge=vmbr2,ip=10.80.0.2/30 \
+  --net2 name=eth2,bridge=vmbr1,ip=192.168.52.30/24 \
   --features nesting=0'
 ```
 
-`net1` carries **no gateway** on purpose. It exists only as a source address
-for the host's policy rule; the container's default route stays on the LAN.
+Three legs, each with one job: `eth0` for MQTT and admin, `eth1` as the source
+address for Mobi.e egress, `eth2` facing the charger on the IoT side.
+
+`net1` and `net2` carry **no gateway** on purpose. The container's only default
+route stays on the LAN; Mobi.e traffic is selected by policy rule, not by
+default route.
 
 No `nesting=1`, no `keyctl=1`, and no device passthrough — this container runs
 a bare binary, not Docker, and never touches the USB device.
 
-## Step 5 — Restrict who can reach the charger port
+## Step 5 — Container-side policy routing
 
-The charger is an internet-capable appliance on the main LAN. Use the Proxmox
-firewall on the container's NIC — not host `iptables`, which does not reliably
-see bridged traffic:
+**This is the step most easily missed, and it fails in a misleading way.**
+
+Binding the upstream socket to `10.80.0.2` sets the source address. It does not
+choose a route. Without a rule inside the container, the kernel resolves the
+Mobi.e destination against the main table, matches the default route via
+`192.168.50.1`, and hands the main router a packet sourced from `10.80.0.2` —
+an address it has never heard of. The symptom is "Mobi.e unreachable", not
+"routing misconfigured".
+
+The rule is therefore needed in **both** places: in the container so the packet
+is sent to the host across `vmbr2`, and on the host (Step 2) so the host
+forwards it out `wwan0` rather than back to the LAN.
+
+```bash
+scp guest/ocpp-wwan-policy.service proxmox:/tmp/
+ssh proxmox 'pct push 113 /tmp/ocpp-wwan-policy.service /etc/systemd/system/ocpp-wwan-policy.service
+             pct exec 113 -- systemctl daemon-reload
+             pct exec 113 -- systemctl enable --now ocpp-wwan-policy'
+```
+
+`ocpp-proxy.service` declares `Requires=` and `After=` on this unit, so the
+proxy cannot start with the route missing.
+
+Verify from inside the container:
+
+```bash
+ssh proxmox 'pct exec 113 -- ip rule show | grep 10.80.0.2
+             pct exec 113 -- ip route show table 100'
+```
+
+## Step 6 — Restrict who can reach the charger port
+
+> **The Proxmox firewall is currently disabled datacenter-wide.** `pve-firewall
+> status` reports `disabled/running`, there is no `/etc/pve/firewall/cluster.fw`,
+> and no guest has `firewall=1` set. Until the datacenter firewall is enabled,
+> the `firewall=1` in the `pct create` above and every rule below is inert.
+> Enabling it cluster-wide needs care: a default `policy_in: DROP` at datacenter
+> level will lock you out of SSH and the 8006 web UI unless the management
+> allows are in place first. Treat that as its own piece of work.
+
+With the charger now on the isolated IoT network the urgency is lower, but the
+proxy is still dual-homed onto the main LAN. Use the Proxmox firewall on the
+container's NIC — not host `iptables`, which does not reliably see bridged
+traffic:
 
 ```
 # /etc/pve/firewall/113.fw on the host
@@ -141,15 +215,15 @@ policy_in: DROP
 policy_out: ACCEPT
 
 [RULES]
-IN ACCEPT -source 192.168.50.<charger> -p tcp -dport 9000 -log nolog # charger OCPP
+IN ACCEPT -source 192.168.51.<charger> -p tcp -dport 9000 -log nolog # charger OCPP, IoT side
 IN ACCEPT -source 192.168.50.167       -p tcp -dport 8080 -log nolog # HA health poll
 IN ACCEPT -source 192.168.50.0/24      -p tcp -dport 22   -log nolog # admin
 ```
 
-Give the charger a **DHCP reservation on the main router** first, so its address
+Give the charger a **DHCP reservation on the spare BD4** first, so its address
 is stable enough to name here.
 
-## Step 6 — Install the proxy
+## Step 7 — Install the proxy
 
 ```bash
 cargo build --release                        # or build on LXC 106 (gha-runner)
@@ -172,12 +246,12 @@ ssh proxmox 'pct exec 113 -- systemctl daemon-reload
              pct exec 113 -- systemctl enable --now ocpp-proxy'
 ```
 
-## Step 7 — Point the charger at the proxy
+## Step 8 — Point the charger at the proxy
 
 In the Autel's OCPP settings, set the Central System URL to:
 
 ```
-ws://192.168.50.28:9000/<Charge_Point_ID>
+ws://192.168.52.30:9000/<Charge_Point_ID>
 ```
 
 The Charge Point ID must be exactly the one registered with Mobi.e — the proxy
@@ -218,10 +292,10 @@ for an extended period and charging must be restored:
 1. Move the SIM from the dongle back into the charger, if the charger has a SIM
    slot and was previously provisioned for this APN.
 2. Restore the charger's OCPP URL to Mobi.e's endpoint directly, replacing
-   `ws://192.168.50.28:9000/...`.
+   `ws://192.168.52.30:9000/...`.
 3. Record the change — the proxy will not see traffic again until it is undone,
    and Home Assistant will show the charger permanently offline.
 
 **Capture the charger's original Mobi.e URL and its OCPP settings before
-step 7 above.** Without them this bypass cannot be performed, and recovering
+step 8 above.** Without them this bypass cannot be performed, and recovering
 them from Mobi.e support during an outage is not a plan.

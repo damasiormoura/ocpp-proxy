@@ -1,8 +1,9 @@
 [Unit]
 Description=OCPP 1.6J proxy — Autel charger to Mobi.e, with MQTT for Home Assistant
 Documentation=https://github.com/damasiormoura/ocpp-proxy
-After=network-online.target
+After=network-online.target ocpp-wwan-policy.service
 Wants=network-online.target
+Requires=ocpp-wwan-policy.service
 
 [Service]
 Type=simple

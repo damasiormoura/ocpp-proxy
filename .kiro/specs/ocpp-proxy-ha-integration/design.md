@@ -46,12 +46,12 @@ graph TB
         HA["VM 110 homeassistant<br/>HAOS + Mosquitto<br/>192.168.50.167"]
     end
 
-    subgraph LAN["Main LAN 192.168.50.0/24"]
+    subgraph LAN["IoT network 192.168.51.0/24"]
         Powerline["TP-Link powerline AP"]
         Charger["Autel EV Charger<br/>OCPP 1.6J Client"]
     end
 
-    Charger -->|"ws:// LAN"| Powerline
+    Charger -->|"ws:// IoT net"| Powerline
     Powerline --> Proxy
     Proxy -->|"wss:// via policy route"| Dongle
     Dongle -->|"APN"| CentralSystem
@@ -67,7 +67,7 @@ Three distinct paths leave the proxy, and they must not be confused with one ano
 
 | Path | Source | Destination | Route |
 |---|---|---|---|
-| Charger → Proxy | `192.168.50.0/24` | Proxy LXC LAN address | Main LAN, inbound |
+| Charger → Proxy | `192.168.51.0/24` (IoT) | Proxy LXC `vmbr1` address | Spare router static route via `192.168.51.10`, then host |
 | Proxy → Mobi.e | dedicated bind address | Central System | Policy route out `wwan0` |
 | Proxy → MQTT | Proxy LXC LAN address | `192.168.50.167:1883` | Main LAN, default route |
 
@@ -75,13 +75,17 @@ Three distinct paths leave the proxy, and they must not be confused with one ano
 
 **Interface naming must not depend on the MAC.** The dongle enumerated as `enx344b50000000` from a placeholder MAC of `34:4b:50:00:00:00` presented before SIM registration. That MAC is expected to change once a SIM is inserted, which would rename the interface and silently break every route and firewall rule that names it. A systemd `.link` file matching on `idVendor=19d2`/`idProduct=1405` pins the name to `wwan0`.
 
-**Egress selection is by policy routing on source address, not by destination prefix.** The proxy binds its upstream socket to a dedicated address on a small point-to-point bridge; the host has an `ip rule` sending traffic from that address to a `wwan` routing table. Selecting by destination prefix instead would require knowing and pinning Mobi.e's IP addresses, which breaks if they change or sit behind a CDN. This is why Requirement 2 criterion 7 adds `upstream_bind_address` to the proxy's configuration — it is the hook the routing policy keys on.
+**Egress selection is by policy routing on source address, not by destination prefix.** The proxy binds its upstream socket to a dedicated address on a small point-to-point bridge, and an `ip rule` sends traffic from that address to a `wwan` routing table. Selecting by destination prefix instead would require knowing and pinning Mobi.e's IP addresses, which breaks if they change or sit behind a CDN. This is why Requirement 2 criterion 7 adds `upstream_bind_address` to the proxy's configuration — it is the hook the routing policy keys on.
+
+**The policy rule is required in two places, not one.** Binding the socket sets the source address; it does not choose a route. Inside the container, without its own rule, the kernel resolves the Mobi.e destination against the main table, matches the LAN default route, and hands the main router a packet sourced from an address it has never heard of. The rule is therefore needed in the container, so the packet crosses `vmbr2` to the host, *and* on the host, so the host forwards it out `wwan0` rather than back to the LAN. Omitting the container-side half produces "Mobi.e unreachable", which reads as an upstream fault rather than a routing mistake.
+
+**There is no DNS on the mobile path.** Measured against the live SIM: the dongle offers no DNS server in its lease, does not proxy port 53 on its own gateway, and public resolvers are unreachable. The proxy therefore resolves the Central System hostname through the LAN resolver and connects over the APN — name resolution and transport deliberately take different paths. If the hostname does not resolve publicly, or resolves to an address unreachable inside the APN, the endpoint must be configured by IP.
 
 **The WWAN link must never supply a default route.** The host's only default route stays on the LAN. A default route arriving by DHCP from the dongle would silently pull unrelated host traffic — including Proxmox updates and the Claude runners — over a metered mobile link.
 
 **MSS clamping is required, not optional.** Mobile APNs frequently present an MTU below 1500. Without clamping, the TCP handshake succeeds and small OCPP frames flow, but larger frames stall — producing an intermittent fault that looks like an application bug and is expensive to diagnose.
 
-Two values are unknown until the SIM is inserted and the APN is configured, and both are recorded in the deployment runbook rather than guessed here: the address and gateway the dongle serves on its LAN side, and whether the Mobi.e hostname resolves through public DNS or only through the APN's resolvers. If the latter, the host's existing dnsmasq gains a domain-specific `server=` entry for that zone.
+The dongle's LAN side is now known: `192.168.0.0/24`, gateway `192.168.0.1`. The APN itself is a closed network — generic internet egress and all DNS are blocked while the modem reports a healthy connected LTE session, which is the expected behaviour of a Mobi.e-only APN and must not be treated as a fault. What remains unknown is the Central System endpoint itself, without which the path cannot be tested end to end.
 
 ### Availability and Failure Modes
 
@@ -93,6 +97,7 @@ Two values are unknown until the SIM is inserted and the APN is configured, and 
 | Dongle unplugged or APN down | **No charging authorization** | Proxy reports WWAN down | Host watchdog re-establishes link |
 | MQTT broker down | None | No events; retained status stale | Proxy buffers, reconnects |
 | Charger offline | None (nothing to charge) | Status shows disconnected | Health reports `idle`, not a fault |
+| Host WiFi association drops | **No charging authorization** | Charger shows disconnected | Reassociation; new dependency introduced by moving the charger to the IoT network |
 
 The row that matters is the third. There is no failover, and building one is out of scope: it would require a second APN path or returning the SIM to the charger. What the design owes the operator instead is that the first two rows recover unattended, and that rows three and four are unmistakable in Home Assistant rather than presenting as a charger that quietly stopped working.
 

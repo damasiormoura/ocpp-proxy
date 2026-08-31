@@ -203,13 +203,32 @@ The Proxy is therefore designed to fail *closed and loudly* — it must make its
 
 ### Requirement 12: Network Placement and Isolation
 
-**User Story:** As the operator of this network, I want the charger's presence on my LAN not to undo the IoT isolation work already done, so that an internet-capable appliance cannot reach my infrastructure.
+**User Story:** As the operator of this network, I want the charger's presence not to undo the IoT isolation work already done, so that an internet-capable appliance and the physically accessible Ethernet jack beside it cannot reach my infrastructure.
+
+> **Resolved in favour of isolation.** The TP-Link TL-WPA4220 powerline uplink was moved from the main router to a LAN port of the spare BD4, so the charger and the powerline's own Ethernet ports now land on the isolated IoT network instead of the main LAN. The decision was forced by a property of the hardware: the TL-WPA4220 has no port disable, and because a main-LAN charger would share a layer-2 segment with the infrastructure, no router firewall rule could have constrained it — intra-subnet traffic never reaches the router.
 
 #### Acceptance Criteria
 
-1. THE Charger connects over a TP-Link powerline access point that bridges into the main LAN, and SHALL therefore receive an address in `192.168.50.0/24`
-2. THE Charger SHALL be given a DHCP reservation on the main router so that its address is stable and can be referenced in firewall rules
-3. THE Proxmox_Host SHALL restrict inbound access to the Proxy's charger-facing port to the Charger's reserved address only
-4. THE design SHALL treat the Charger's placement on the main LAN as a known isolation regression: it shares a layer-2 segment with Keycloak (LXC 109), the CI runner (LXC 106), the Claude runners (LXC 107) and the Proxmox management interface, none of which the Charger has any reason to reach
-5. THE design SHALL keep the Proxy's charger-facing listen address configurable so that relocating the Charger onto the isolated IoT network — by moving the powerline uplink to a LAN port of the spare BD4, placing the Charger in `192.168.51.0/24` behind the existing DROP rule, and giving the Proxy_LXC a second interface on `vmbr1` — is a configuration change rather than a redesign
-6. IF the Charger is relocated to the IoT network, THEN the existing isolation rule (`192.168.51.0/24 -d 192.168.50.0/24 -j DROP`, reapplied by `iot-isolation-enforce.sh`) SHALL remain unmodified, because the Proxy would then be reached at a `192.168.52.0/24` address that the rule does not match
+1. THE Charger SHALL connect through the TL-WPA4220 powerline access point, whose uplink terminates on a LAN port of the spare BD4, placing it in `192.168.51.0/24`
+2. THE Proxy_LXC SHALL carry an interface on `vmbr1` (`192.168.52.0/24`) and SHALL bind its charger-facing listener to that address, reusing the path Home Assistant and Frigate already use
+3. THE existing isolation rule (`192.168.51.0/24 -d 192.168.50.0/24 -j DROP`, reapplied by `iot-isolation-enforce.sh`) SHALL remain unmodified. The Charger reaches the Proxy at a `192.168.52.0/24` address, which that rule does not match, so no exception is required
+4. THE Charger SHALL be given a DHCP reservation on the spare BD4 so its address is stable
+5. THE design SHALL accept that the Charger-to-Proxy path now crosses the Proxmox host's WiFi client association (`wlp129s0f0`) to the spare router. This places a wireless link on the Charger's only path to Mobi.e. Bandwidth is not a concern for OCPP, but the association's stability is now a charging dependency and SHALL be monitored
+6. THE powerline adapters SHALL be configured with a non-default powerline network name. Powerline is a shared medium: any adapter on the same electrical circuit that knows the default key, or that is paired by button press, joins the same layer-2 segment without needing physical access to the unit
+7. Unused Ethernet ports on the TL-WPA4220 SHOULD be physically blocked. The model has no software port control, so this is the only available mitigation for the jack itself
+8. THE Proxy SHALL NOT be reachable from the main LAN except for administrative access and its MQTT client traffic
+
+### Requirement 13: APN Path Characteristics
+
+**User Story:** As the operator, I want the constraints of the mobile path recorded, so that nobody later assumes it behaves like an ordinary internet connection.
+
+> Measured 2026-08-31 against the ZTE dongle with the SIM installed, operator NOS, LTE, `ppp_status: ppp_connected`, full signal.
+
+#### Acceptance Criteria
+
+1. THE APN is a closed network. Generic internet egress is blocked: ICMP to `1.1.1.1` and TCP to public HTTP endpoints both fail while the modem reports a healthy connected session
+2. THE APN provides no usable DNS. The dongle offers no DNS server in its DHCP lease, does not proxy port 53 on its own gateway address, and public resolvers are unreachable over the path
+3. THE Proxy SHALL therefore resolve the Central_System hostname over the LAN resolver while connecting over the WWAN_Link. Name resolution and transport deliberately take different paths
+4. IF the Central_System hostname does not resolve publicly, or resolves to an address not reachable inside the APN, THEN the endpoint SHALL be configured by IP address and that fact SHALL be recorded, since no DNS is available on the mobile path to resolve it
+5. THE absence of generic internet egress SHALL NOT be treated as a fault. It is the expected behaviour of a private APN and confirms the SIM is provisioned for Mobi.e traffic only
+6. Reachability of the WWAN_Link SHALL be tested against the Central_System endpoint itself, not against a public host, because no public host is reachable

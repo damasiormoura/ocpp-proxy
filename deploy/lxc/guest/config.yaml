@@ -7,6 +7,11 @@
 # point, and whether its hostname resolves through public DNS or only through
 # the APN's resolvers. If only through the APN, add a domain-specific
 # "server=/<zone>/<apn-dns>" entry to the host's existing dnsmasq.
+# NOTE: the APN provides no DNS (measured — the dongle offers no DNS server,
+# does not proxy port 53, and public resolvers are unreachable over it). The
+# hostname below is resolved by the LXC's LAN resolver while the socket itself
+# egresses over the APN. If the name does not resolve publicly, or resolves to
+# an address unreachable inside the APN, configure it by IP instead.
 central_system_url: "wss://__MOBIE_HOST__/ocpp/v16"
 
 # Source address for the upstream socket. The host's policy rule
@@ -17,13 +22,13 @@ central_system_url: "wss://__MOBIE_HOST__/ocpp/v16"
 upstream_bind_address: "10.80.0.2"
 
 # --- Charger-facing listener ----------------------------------------------
-# The charger reaches the proxy over the TP-Link powerline AP on the main LAN.
-# Bound to the LXC's LAN address specifically, so the listener is never exposed
-# on the 10.80.0.0/30 WWAN-egress leg.
-#
-# If the charger is later moved onto the isolated IoT network (see Requirement
-# 12), this becomes the LXC's vmbr1 address and nothing else changes.
-listen_address: "192.168.50.28"
+# The charger is on the isolated IoT network (192.168.51.0/24), reached through
+# the TL-WPA4220 powerline AP whose uplink now terminates on the spare BD4.
+# It reaches the proxy at this vmbr1 address via the spare router's existing
+# static route 192.168.52.0/24 via 192.168.51.10 — the same path Home Assistant
+# and Frigate already use. The isolation DROP rule does not match this
+# destination, so it needs no exception.
+listen_address: "192.168.52.30"
 listen_port: 9000
 
 health_port: 8080
