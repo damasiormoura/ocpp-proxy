@@ -118,36 +118,41 @@ mqtt:
     # =======================================================================
     # Charge point state, from StatusNotification
     # =======================================================================
+    # These read the RETAINED state topic, not the StatusNotification event
+    # topic. Events are published non-retained, so a subscriber that connects
+    # afterwards — Home Assistant restarting — sees nothing until the charger
+    # next changes state, which overnight can be hours. The retained snapshot
+    # is delivered the instant HA subscribes.
     - name: "Charger Status"
       unique_id: ocpp_charger_status
-      state_topic: "ocpp/MOBI-ALM-00058/charger/StatusNotification"
+      state_topic: "ocpp/MOBI-ALM-00058/state"
       icon: mdi:ev-station
       # Available / Preparing / Charging / SuspendedEV / SuspendedEVSE /
       # Finishing / Reserved / Unavailable / Faulted
-      value_template: "{{ value_json.payload[3].status | default('Unknown', true) }}"
-      json_attributes_topic: "ocpp/MOBI-ALM-00058/charger/StatusNotification"
-      json_attributes_template: "{{ value_json.payload[3] | tojson }}"
+      value_template: "{{ value_json.connector_status | default('Unknown', true) }}"
+      json_attributes_topic: "ocpp/MOBI-ALM-00058/state"
       availability: *proxy_availability
       device: *charger_device
 
     - name: "Charger Error Code"
       unique_id: ocpp_charger_error_code
-      state_topic: "ocpp/MOBI-ALM-00058/charger/StatusNotification"
+      state_topic: "ocpp/MOBI-ALM-00058/state"
       icon: mdi:alert-circle-outline
-      value_template: "{{ value_json.payload[3].errorCode | default('NoError', true) }}"
+      value_template: "{{ value_json.error_code | default('NoError', true) }}"
       availability: *proxy_availability
       device: *charger_device
 
     # =======================================================================
     # Transaction, from StartTransaction / StopTransaction
     # =======================================================================
-    # The Central System assigns the transaction id, so it comes from the
-    # CallResult — payload[2], not payload[3].
+    # Also from the retained snapshot: the proxy folds the Central System's
+    # StartTransaction result into it and clears it on StopTransaction, so an
+    # ended session does not leave a stale id looking like an open one.
     - name: "Charger Transaction ID"
       unique_id: ocpp_charger_transaction_id
-      state_topic: "ocpp/MOBI-ALM-00058/central_system/StartTransaction"
+      state_topic: "ocpp/MOBI-ALM-00058/state"
       icon: mdi:identifier
-      value_template: "{{ value_json.payload[2].transactionId | default('none', true) }}"
+      value_template: "{{ value_json.transaction_id | default('none', true) }}"
       availability: *proxy_availability
       device: *charger_device
 
@@ -159,17 +164,27 @@ mqtt:
       availability: *proxy_availability
       device: *charger_device
 
-    # Meter reading at the moment the transaction opened. Used to derive the
-    # energy delivered in the current session.
+    # Meter reading at the moment the transaction opened, from the retained
+    # snapshot. Marked unavailable while no transaction is open, rather than
+    # reporting a stale or zero figure that would make session energy wrong.
     - name: "Charger Session Meter Start"
       unique_id: ocpp_charger_session_meter_start
-      state_topic: "ocpp/MOBI-ALM-00058/charger/StartTransaction"
+      state_topic: "ocpp/MOBI-ALM-00058/state"
       device_class: energy
       state_class: total
       unit_of_measurement: "kWh"
       value_template: >-
-        {{ (value_json.payload[3].meterStart | float(0) / 1000) | round(3) }}
-      availability: *proxy_availability
+        {{ ((value_json.meter_start_wh | default(0, true)) | float(0) / 1000) | round(3) }}
+      availability_mode: all
+      availability:
+        - topic: "ocpp/MOBI-ALM-00058/availability"
+          payload_available: "online"
+          payload_not_available: "offline"
+        - topic: "ocpp/MOBI-ALM-00058/state"
+          value_template: >-
+            {{ 'online' if value_json.meter_start_wh is not none else 'offline' }}
+          payload_available: "online"
+          payload_not_available: "offline"
       device: *charger_device
 
     - name: "Charger Last Session Energy"

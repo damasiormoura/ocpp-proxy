@@ -43,6 +43,101 @@ pub struct MqttPayload {
     pub payload: serde_json::Value,
 }
 
+/// Retained snapshot of what the charge point is currently doing.
+///
+/// Exists because the per-message topics are events, not state: they are
+/// published non-retained, so a consumer that subscribes after the fact — Home
+/// Assistant restarting, say — sees nothing until the charger next changes
+/// state. That can be hours. This topic is retained, so a subscriber learns
+/// the current status the moment it connects.
+///
+/// Deliberately excludes anything derived from MeterValues. Those arrive every
+/// few seconds during a charge, and retaining them would mean a retained
+/// publish per meter reading for values the consumer already gets live from
+/// the MeterValues topic itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+pub struct ChargePointState {
+    /// Latest connector status: Available, Preparing, Charging, Faulted, ...
+    pub connector_status: Option<String>,
+    /// Latest error code; `NoError` when healthy.
+    pub error_code: Option<String>,
+    /// Transaction currently open, as assigned by the Central System.
+    pub transaction_id: Option<i64>,
+    /// The tag that authorised the open transaction.
+    pub id_tag: Option<String>,
+    /// Meter reading in Wh when the open transaction started.
+    pub meter_start_wh: Option<i64>,
+    /// ISO 8601 time this snapshot last changed.
+    pub last_updated: Option<String>,
+}
+
+impl ChargePointState {
+    /// Fold one forwarded OCPP message into the snapshot.
+    ///
+    /// Returns whether anything actually changed, so the caller only publishes
+    /// on a real transition rather than on every message.
+    pub fn apply(&mut self, action: &str, message_type: &OcppMessageType, raw: &str) -> bool {
+        let Some(args) = ocpp_args(raw, message_type) else {
+            return false;
+        };
+        let before = self.clone();
+
+        match (action, message_type) {
+            ("StatusNotification", OcppMessageType::Call { .. }) => {
+                if let Some(v) = args.get("status").and_then(|v| v.as_str()) {
+                    self.connector_status = Some(v.to_string());
+                }
+                if let Some(v) = args.get("errorCode").and_then(|v| v.as_str()) {
+                    self.error_code = Some(v.to_string());
+                }
+            }
+            ("StartTransaction", OcppMessageType::Call { .. }) => {
+                self.meter_start_wh = args.get("meterStart").and_then(|v| v.as_i64());
+                self.id_tag = args
+                    .get("idTag")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+            // The Central System assigns the id, so it arrives on the result.
+            ("StartTransaction", OcppMessageType::CallResult) => {
+                self.transaction_id = args.get("transactionId").and_then(|v| v.as_i64());
+            }
+            ("StopTransaction", OcppMessageType::Call { .. }) => {
+                self.transaction_id = None;
+                self.id_tag = None;
+                self.meter_start_wh = None;
+            }
+            _ => return false,
+        }
+
+        if *self == before {
+            return false;
+        }
+        self.last_updated = Some(chrono::Utc::now().to_rfc3339());
+        true
+    }
+}
+
+/// Extract the argument object from a raw OCPP frame.
+///
+/// The index depends on the message type, NOT on which side sent it: a Call is
+/// `[2, uniqueId, action, args]` and a CallResult is `[3, uniqueId, args]`.
+/// Keying off direction instead happens to work for charger-initiated traffic
+/// and breaks on anything the Central System initiates, such as
+/// RemoteStartTransaction.
+fn ocpp_args(
+    raw: &str,
+    message_type: &OcppMessageType,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let arr = parsed.as_array()?;
+    let index = match message_type {
+        OcppMessageType::Call { .. } => 3,
+        OcppMessageType::CallResult | OcppMessageType::CallError => 2,
+    };
+    arr.get(index)?.as_object().cloned()
+}
+
 /// JSON payload published for connection status changes.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct StatusPayload {
@@ -104,6 +199,8 @@ pub struct MqttPublisher {
     state: ConnectionState,
     /// Exponential backoff for reconnection (1s initial, 30s max).
     backoff: ExponentialBackoff,
+    /// Retained snapshot of the charge point, per Charge Point ID.
+    charge_point_state: std::collections::HashMap<String, ChargePointState>,
 }
 
 impl MqttPublisher {
@@ -178,6 +275,7 @@ impl MqttPublisher {
                 Duration::from_secs(1),
                 Duration::from_secs(30),
             ),
+            charge_point_state: std::collections::HashMap::new(),
         })
     }
 
@@ -433,6 +531,11 @@ impl MqttPublisher {
                 let dir_str = direction_str(direction);
                 let topic = message_topic(&charge_point_id, dir_str, &action);
 
+                // Kept for the retained snapshot below: `frame` is consumed
+                // when the per-message payload is built.
+                let raw = frame.raw.clone();
+                let message_type = frame.message_type.clone();
+
                 // Parse the raw OCPP JSON for the payload field
                 let payload_value = serde_json::from_str::<serde_json::Value>(&frame.raw)
                     .unwrap_or_else(|_| serde_json::Value::String(frame.raw.clone()));
@@ -499,6 +602,24 @@ impl MqttPublisher {
                         qos: QoS::AtLeastOnce,
                         retain: false,
                     });
+                }
+
+                // Fold the message into the retained snapshot, and republish
+                // only if it actually changed something.
+                let snapshot = {
+                    let entry = self
+                        .charge_point_state
+                        .entry(charge_point_id.clone())
+                        .or_default();
+                    if entry.apply(&action, &message_type, &raw) {
+                        Some(entry.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(snapshot) = snapshot {
+                    self.publish_charge_point_state(&charge_point_id, &snapshot)
+                        .await;
                 }
             }
             MqttEvent::StateChange {
@@ -572,6 +693,64 @@ impl MqttPublisher {
                     });
                 }
             }
+        }
+    }
+
+    /// Publish the retained charge point snapshot.
+    ///
+    /// Retained and QoS 1: a subscriber that connects later must be told the
+    /// current state immediately rather than waiting for the charger's next
+    /// transition, which during an idle night is hours away.
+    async fn publish_charge_point_state(
+        &mut self,
+        charge_point_id: &str,
+        snapshot: &ChargePointState,
+    ) {
+        let topic = charge_point_state_topic(charge_point_id);
+        let bytes = match serde_json::to_vec(snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    component = "mqtt",
+                    error = %e,
+                    "Failed to serialize charge point state"
+                );
+                return;
+            }
+        };
+
+        if self.state == ConnectionState::Connected {
+            if let Err(e) = self
+                .client
+                .publish(&topic, QoS::AtLeastOnce, true, bytes.clone())
+                .await
+            {
+                warn!(
+                    component = "mqtt",
+                    topic = %topic,
+                    error = %e,
+                    "Failed to publish charge point state, buffering"
+                );
+                self.buffer_message(MqttMessage {
+                    topic,
+                    payload: bytes,
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                });
+            } else {
+                debug!(
+                    component = "mqtt",
+                    topic = %topic,
+                    "Published retained charge point state"
+                );
+            }
+        } else {
+            self.buffer_message(MqttMessage {
+                topic,
+                payload: bytes,
+                qos: QoS::AtLeastOnce,
+                retain: true,
+            });
         }
     }
 
@@ -677,6 +856,11 @@ pub fn message_topic(charge_point_id: &str, direction: &str, action: &str) -> St
     format!("ocpp/{}/{}/{}", charge_point_id, direction, action)
 }
 
+/// Construct the retained charge point state topic.
+pub fn charge_point_state_topic(charge_point_id: &str) -> String {
+    format!("ocpp/{}/state", charge_point_id)
+}
+
 /// Construct the status topic for a given charge point ID.
 pub fn status_topic(charge_point_id: &str) -> String {
     format!("ocpp/{}/status", charge_point_id)
@@ -685,6 +869,159 @@ pub fn status_topic(charge_point_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- retained charge point state ----
+
+    fn call(action: &str) -> OcppMessageType {
+        OcppMessageType::Call {
+            action: action.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_state_topic() {
+        assert_eq!(
+            charge_point_state_topic("MOBI-ALM-00058"),
+            "ocpp/MOBI-ALM-00058/state"
+        );
+    }
+
+    /// Call args live at index 3, CallResult args at index 2. Indexing by
+    /// direction instead of message type breaks on Central-System-initiated
+    /// Calls, so this pins the rule down.
+    #[test]
+    fn test_ocpp_args_index_follows_message_type_not_direction() {
+        let call_frame = r#"[2,"id","StatusNotification",{"status":"Charging"}]"#;
+        let result_frame = r#"[3,"id",{"transactionId":42}]"#;
+
+        let a = ocpp_args(call_frame, &call("StatusNotification")).unwrap();
+        assert_eq!(a.get("status").unwrap(), "Charging");
+
+        let b = ocpp_args(result_frame, &OcppMessageType::CallResult).unwrap();
+        assert_eq!(b.get("transactionId").unwrap(), 42);
+    }
+
+    #[test]
+    fn test_status_notification_updates_snapshot() {
+        let mut st = ChargePointState::default();
+        let changed = st.apply(
+            "StatusNotification",
+            &call("StatusNotification"),
+            r#"[2,"1","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Charging"}]"#,
+        );
+        assert!(changed);
+        assert_eq!(st.connector_status.as_deref(), Some("Charging"));
+        assert_eq!(st.error_code.as_deref(), Some("NoError"));
+        assert!(st.last_updated.is_some());
+    }
+
+    /// Only real transitions should cause a retained republish.
+    #[test]
+    fn test_repeated_identical_status_reports_no_change() {
+        let raw = r#"[2,"1","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Charging"}]"#;
+        let mut st = ChargePointState::default();
+        assert!(st.apply("StatusNotification", &call("StatusNotification"), raw));
+        assert!(
+            !st.apply("StatusNotification", &call("StatusNotification"), raw),
+            "an identical status must not trigger another retained publish"
+        );
+    }
+
+    /// The whole lifecycle the dashboard depends on.
+    #[test]
+    fn test_full_transaction_lifecycle() {
+        let mut st = ChargePointState::default();
+
+        st.apply(
+            "StatusNotification",
+            &call("StatusNotification"),
+            r#"[2,"1","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Preparing"}]"#,
+        );
+        st.apply(
+            "StartTransaction",
+            &call("StartTransaction"),
+            r#"[2,"2","StartTransaction",{"connectorId":1,"idTag":"7264b25e","meterStart":8076445}]"#,
+        );
+        assert_eq!(st.meter_start_wh, Some(8076445));
+        assert_eq!(st.id_tag.as_deref(), Some("7264b25e"));
+        assert_eq!(st.transaction_id, None, "id is not known until the result");
+
+        st.apply(
+            "StartTransaction",
+            &OcppMessageType::CallResult,
+            r#"[3,"2",{"idTagInfo":{"status":"Accepted"},"transactionId":1788214378}]"#,
+        );
+        assert_eq!(st.transaction_id, Some(1788214378));
+
+        st.apply(
+            "StatusNotification",
+            &call("StatusNotification"),
+            r#"[2,"3","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Charging"}]"#,
+        );
+        assert_eq!(st.connector_status.as_deref(), Some("Charging"));
+
+        // Stopping must clear the transaction, or the dashboard shows a stale
+        // one as if a session were still open.
+        st.apply(
+            "StopTransaction",
+            &call("StopTransaction"),
+            r#"[2,"4","StopTransaction",{"idTag":"7264b25e","meterStop":8080000,"transactionId":1788214378}]"#,
+        );
+        assert_eq!(st.transaction_id, None);
+        assert_eq!(st.meter_start_wh, None);
+        assert_eq!(st.id_tag, None);
+        assert_eq!(
+            st.connector_status.as_deref(),
+            Some("Charging"),
+            "StopTransaction does not itself change connector status"
+        );
+    }
+
+    /// MeterValues arrives every few seconds while charging; folding it in
+    /// would mean a retained publish per meter reading.
+    #[test]
+    fn test_meter_values_never_changes_the_snapshot() {
+        let mut st = ChargePointState::default();
+        let changed = st.apply(
+            "MeterValues",
+            &call("MeterValues"),
+            r#"[2,"5","MeterValues",{"connectorId":1,"meterValue":[{"sampledValue":[{"measurand":"Power.Active.Import","value":"3651"}]}]}]"#,
+        );
+        assert!(!changed);
+        assert_eq!(st, ChargePointState::default());
+    }
+
+    #[test]
+    fn test_malformed_frame_is_ignored() {
+        let mut st = ChargePointState::default();
+        assert!(!st.apply(
+            "StatusNotification",
+            &call("StatusNotification"),
+            "not json"
+        ));
+        assert!(!st.apply(
+            "StatusNotification",
+            &call("StatusNotification"),
+            r#"[2,"1"]"#
+        ));
+        assert_eq!(st, ChargePointState::default());
+    }
+
+    #[test]
+    fn test_snapshot_serializes_to_the_documented_shape() {
+        let mut st = ChargePointState::default();
+        st.apply(
+            "StatusNotification",
+            &call("StatusNotification"),
+            r#"[2,"1","StatusNotification",{"connectorId":1,"errorCode":"NoError","status":"Charging"}]"#,
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&st).unwrap()).unwrap();
+        assert_eq!(v["connector_status"], "Charging");
+        assert_eq!(v["error_code"], "NoError");
+        assert!(v["transaction_id"].is_null());
+        assert!(v["last_updated"].is_string());
+    }
 
     #[test]
     fn test_availability_topic_construction() {
