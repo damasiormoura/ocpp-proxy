@@ -1,0 +1,7 @@
+[Unit]
+Description=Re-assert the OCPP proxy's WWAN egress path
+Documentation=https://github.com/damasiormoura/ocpp-proxy
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wwan-watchdog.sh

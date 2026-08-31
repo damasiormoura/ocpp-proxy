@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically re-assert the OCPP proxy's WWAN egress path
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

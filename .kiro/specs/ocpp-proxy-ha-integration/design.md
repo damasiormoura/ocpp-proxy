@@ -2,58 +2,99 @@
 
 ## Overview
 
-This document describes the technical design for an OCPP 1.6J WebSocket proxy hosted on AWS that sits between an Autel EV charger and the Mobi.e Central System. The proxy transparently forwards all OCPP messages bidirectionally while capturing events and publishing them to an MQTT broker for Home Assistant integration on a local Raspberry Pi 4.
+This document describes the technical design for an OCPP 1.6J WebSocket proxy that sits between an Autel EV charger and the Mobi.e Central System. The proxy transparently forwards all OCPP messages bidirectionally while capturing events and publishing them to an MQTT broker for Home Assistant integration.
+
+The proxy runs as an unprivileged LXC container on the existing Proxmox host. It reaches Mobi.e over a mobile APN served by a ZTE 4G USB dongle owned by the host, and reaches the charger and the MQTT broker over the local network.
 
 ### Key Design Decisions
 
-1. **Language: Rust** — Chosen for its zero-cost abstractions, memory safety without GC, and excellent async ecosystem. The proxy is a long-running, latency-sensitive process where Rust's performance characteristics and small binary/container size are ideal for cost-efficient AWS deployment.
+1. **Language: Rust** — Zero-cost abstractions, memory safety without GC, and a strong async ecosystem. The proxy is a long-running, latency-sensitive process where a single small static binary is easy to deploy and supervise.
 
-2. **Async Runtime: Tokio** — The de facto standard for async Rust. Provides the executor, timers, I/O primitives, and channels needed for concurrent WebSocket and MQTT operations.
+2. **Async Runtime: Tokio** — Executor, timers, I/O primitives, and channels for concurrent WebSocket and MQTT operation.
 
-3. **WebSocket: tokio-tungstenite** — Mature, well-tested WebSocket library built on Tokio. Supports subprotocol negotiation, which is essential for OCPP 1.6J's `ocpp1.6` subprotocol requirement.
+3. **WebSocket: tokio-tungstenite** — Mature WebSocket library with subprotocol negotiation, required for OCPP 1.6J's `ocpp1.6` subprotocol.
 
-4. **HTTP Framework: axum** — Used for the health check endpoint and WebSocket upgrade handling. Axum integrates natively with Tokio and provides ergonomic routing with tower middleware support.
+4. **HTTP Framework: axum** — Health endpoint and WebSocket upgrade handling, native to Tokio.
 
-5. **MQTT: rumqttc** — Pure Rust async MQTT client backed by Tokio. Supports MQTT 3.1.1, QoS levels 0-2, TLS, Last Will and Testament, and automatic reconnection.
+5. **MQTT: rumqttc** — Pure Rust async MQTT client. MQTT 3.1.1, QoS 0–2, optional TLS, Last Will and Testament.
 
-6. **Configuration: config + serde** — The `config` crate supports layered configuration (environment variables over YAML files), and `serde` provides zero-boilerplate deserialization.
+6. **Configuration: config + serde** — Layered configuration, environment variables over YAML.
 
-7. **Deployment: Single-container on ECS Fargate** — Stateless design with a Network Load Balancer (NLB) fronting the WebSocket port. NLB is preferred over ALB for WebSocket connections due to its layer-4 nature and stable IP support via Elastic IP.
+7. **TLS: rustls throughout, no OpenSSL.** `tokio-tungstenite` moves from the `native-tls` feature to `rustls-tls-webpki-roots`, matching what `rumqttc` already uses. The current build links two TLS stacks and needs system OpenSSL — `libssl-dev` at build time, `libssl3` at runtime. Nothing in the requirements calls for OpenSSL, and dropping it removes a build dependency, shrinks the binary, and removes a class of environment-specific build failures. This becomes more valuable now that deployment is a bare binary in an LXC rather than a container image that could carry its own libraries.
+
+8. **Deployment: unprivileged LXC + systemd, not a container image.** A single Rust binary supervised by systemd with `Restart=always` is simpler than Docker-in-LXC, needs neither `nesting=1` nor `keyctl=1`, and removes the image-size and registry concerns entirely. The Dockerfile is retained only as a development and CI build convenience.
 
 ### Architecture Rationale
 
-The proxy prioritizes Mobi.e communication above all else. MQTT publishing is entirely asynchronous and decoupled from the forwarding path. If the MQTT broker is unreachable, message forwarding continues unaffected. The proxy buffers MQTT messages internally and delivers them when connectivity is restored.
+The proxy prioritizes Mobi.e communication above all else. MQTT publishing is entirely asynchronous and decoupled from the forwarding path. If the MQTT broker is unreachable, message forwarding continues unaffected.
+
+**The availability rationale has inverted from the previous revision.** Hosting on AWS was justified by keeping the charger connected to Mobi.e when the home network was down. Now that the APN SIM lives in a dongle on the Proxmox host, the proxy is the charger's only path to Mobi.e. The design therefore optimizes for fast local recovery and loud failure reporting, and accepts the Proxmox host as a single point of failure for charging and billing. See *Availability and Failure Modes* below.
 
 ## Architecture
 
 ```mermaid
 graph TB
-    subgraph "Internet"
-        Charger[Autel EV Charger<br/>OCPP 1.6J Client]
-        CentralSystem[Mobi.e Central System<br/>OCPP 1.6J Server]
+    subgraph Mobile["Mobile Network"]
+        CentralSystem["Mobi.e Central System<br/>OCPP 1.6J Server"]
     end
 
-    subgraph "AWS"
-        NLB[Network Load Balancer<br/>TLS Termination + Elastic IP]
-        subgraph "ECS Fargate"
-            Proxy[OCPP Proxy Container]
+    subgraph Home["Home — Proxmox host mouraishikawa 192.168.50.10"]
+        Dongle["ZTE 4G USB dongle<br/>19d2:1405 cdc_ether<br/>host iface wwan0"]
+        subgraph LXC["LXC 113 ocpp-proxy (unprivileged)"]
+            Proxy["OCPP Proxy<br/>systemd, Restart=always"]
         end
+        HA["VM 110 homeassistant<br/>HAOS + Mosquitto<br/>192.168.50.167"]
     end
 
-    subgraph "Home Network (Raspberry Pi 4)"
-        MQTT[Mosquitto MQTT Broker<br/>HA Add-on]
-        HA[Home Assistant<br/>HAOS]
+    subgraph LAN["Main LAN 192.168.50.0/24"]
+        Powerline["TP-Link powerline AP"]
+        Charger["Autel EV Charger<br/>OCPP 1.6J Client"]
     end
 
-    Charger -->|WSS via NLB| NLB
-    NLB -->|WS| Proxy
-    Proxy -->|WSS| CentralSystem
-    Proxy -->|MQTTS over Internet| MQTT
-    MQTT --> HA
+    Charger -->|"ws:// LAN"| Powerline
+    Powerline --> Proxy
+    Proxy -->|"wss:// via policy route"| Dongle
+    Dongle -->|"APN"| CentralSystem
+    Proxy -->|"MQTT over LAN"| HA
 
     style Proxy fill:#2d5a27,stroke:#333,color:#fff
-    style NLB fill:#1a3a5c,stroke:#333,color:#fff
+    style Dongle fill:#5c3a1a,stroke:#333,color:#fff
 ```
+
+### Network Design
+
+Three distinct paths leave the proxy, and they must not be confused with one another:
+
+| Path | Source | Destination | Route |
+|---|---|---|---|
+| Charger → Proxy | `192.168.50.0/24` | Proxy LXC LAN address | Main LAN, inbound |
+| Proxy → Mobi.e | dedicated bind address | Central System | Policy route out `wwan0` |
+| Proxy → MQTT | Proxy LXC LAN address | `192.168.50.167:1883` | Main LAN, default route |
+
+**The dongle stays on the host.** It presents as `cdc_ether`, so it is a network interface rather than a serial modem — no ModemManager and no pppd are required, and the APN is configured in the dongle's own web interface. Passing a USB network device into an unprivileged LXC is not practical, and doing so would force the container to become privileged for no benefit. The host owns the link; the LXC reaches it by routing.
+
+**Interface naming must not depend on the MAC.** The dongle enumerated as `enx344b50000000` from a placeholder MAC of `34:4b:50:00:00:00` presented before SIM registration. That MAC is expected to change once a SIM is inserted, which would rename the interface and silently break every route and firewall rule that names it. A systemd `.link` file matching on `idVendor=19d2`/`idProduct=1405` pins the name to `wwan0`.
+
+**Egress selection is by policy routing on source address, not by destination prefix.** The proxy binds its upstream socket to a dedicated address on a small point-to-point bridge; the host has an `ip rule` sending traffic from that address to a `wwan` routing table. Selecting by destination prefix instead would require knowing and pinning Mobi.e's IP addresses, which breaks if they change or sit behind a CDN. This is why Requirement 2 criterion 7 adds `upstream_bind_address` to the proxy's configuration — it is the hook the routing policy keys on.
+
+**The WWAN link must never supply a default route.** The host's only default route stays on the LAN. A default route arriving by DHCP from the dongle would silently pull unrelated host traffic — including Proxmox updates and the Claude runners — over a metered mobile link.
+
+**MSS clamping is required, not optional.** Mobile APNs frequently present an MTU below 1500. Without clamping, the TCP handshake succeeds and small OCPP frames flow, but larger frames stall — producing an intermittent fault that looks like an application bug and is expensive to diagnose.
+
+Two values are unknown until the SIM is inserted and the APN is configured, and both are recorded in the deployment runbook rather than guessed here: the address and gateway the dongle serves on its LAN side, and whether the Mobi.e hostname resolves through public DNS or only through the APN's resolvers. If the latter, the host's existing dnsmasq gains a domain-specific `server=` entry for that zone.
+
+### Availability and Failure Modes
+
+| Failure | Effect on charging | Effect on Home Assistant | Recovery |
+|---|---|---|---|
+| Proxy process crashes | Session drops, charger reconnects | Availability topic goes `offline` | systemd `Restart=always`, ~5 s |
+| Proxy LXC stopped | No Mobi.e connectivity | `offline` | `onboot: 1`; manual `pct start` |
+| Proxmox host down | **No charging, no billing** | Everything down | Host boot; manual bypass if extended |
+| Dongle unplugged or APN down | **No charging authorization** | Proxy reports WWAN down | Host watchdog re-establishes link |
+| MQTT broker down | None | No events; retained status stale | Proxy buffers, reconnects |
+| Charger offline | None (nothing to charge) | Status shows disconnected | Health reports `idle`, not a fault |
+
+The row that matters is the third. There is no failover, and building one is out of scope: it would require a second APN path or returning the SIM to the charger. What the design owes the operator instead is that the first two rows recover unattended, and that rows three and four are unmistakable in Home Assistant rather than presenting as a charger that quietly stopped working.
 
 ### Internal Component Architecture
 
@@ -301,7 +342,7 @@ impl ProxyConfig {
 
 ### 6. Health Check Server
 
-**Responsibility:** Expose HTTP health endpoint for AWS load balancer and monitoring.
+**Responsibility:** Expose an HTTP health endpoint for Home Assistant monitoring and for manual diagnosis. Nothing restarts the proxy based on this endpoint; systemd owns restarts.
 
 **Interface:**
 ```rust
@@ -470,6 +511,16 @@ pub enum ConnectionId {
 pub struct ProxyConfig {
     pub central_system_url: String,
     pub listen_port: u16,
+    /// Charger-facing bind address. Default 0.0.0.0. Set to the LXC's LAN
+    /// address, or to its vmbr1 address if the charger is later moved onto
+    /// the isolated IoT network (Requirement 12).
+    #[serde(default = "default_listen_address")]
+    pub listen_address: IpAddr,
+    /// Local source address for the upstream socket. The host's `ip rule`
+    /// keys on this address to route Central System traffic out wwan0.
+    /// When None, the OS default route is used (development only).
+    #[serde(default)]
+    pub upstream_bind_address: Option<IpAddr>,
     #[serde(default = "default_health_port")]
     pub health_port: u16,
     pub mqtt: MqttConfig,
@@ -485,9 +536,15 @@ pub struct MqttConfig {
     pub port: u16,
     pub username: String,
     pub password: String,
-    pub ca_cert_path: String,
-    pub client_cert_path: String,
-    pub client_key_path: String,
+    /// TLS is optional: the broker is one LAN hop away on VM 110, not across
+    /// the internet. All three None => plaintext. ca only => server-auth TLS.
+    /// All three set => mutual TLS.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_key_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -516,6 +573,8 @@ pub struct HealthResponse {
     pub upstream: ConnectionState,
     pub downstream: ConnectionState,
     pub mqtt: ConnectionState,
+    /// Whether the host's WWAN path to the Central System is usable.
+    pub wwan_reachable: bool,
     pub uptime_seconds: u64,
     pub messages: MessageCounters,
 }
@@ -531,8 +590,16 @@ pub struct MessageCounters {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
+    /// Charger connected, upstream established. HTTP 200.
     Healthy,
+    /// Listening, no charger connected. The normal state when no vehicle is
+    /// plugged in. HTTP 200 — never a fault. See Requirement 10 criterion 4.
+    Idle,
+    /// Forwarding impaired but recoverable: upstream reconnecting inside its
+    /// window, or MQTT down. HTTP 200.
     Degraded,
+    /// Not listening, or upstream failed past its reconnection window while a
+    /// charger is connected. HTTP 503.
     Unhealthy,
 }
 ```
@@ -610,9 +677,11 @@ impl ExponentialBackoff {
 
 ### Property 9: Health status computation is correct for all state combinations
 
-*For any* combination of upstream, downstream, and MQTT connection states: IF downstream is disconnected THEN status SHALL be `unhealthy` (503); ELSE IF upstream and downstream are both connected and MQTT is disconnected THEN status SHALL be `degraded` (200); ELSE IF upstream and downstream are both connected THEN status SHALL be `healthy` (200); ELSE status SHALL be `unhealthy` (503).
+*For any* combination of listener state, upstream, downstream, and MQTT connection states: IF the charger listener is not bound THEN status SHALL be `unhealthy` (503); ELSE IF downstream is disconnected THEN status SHALL be `idle` (200); ELSE IF upstream is connected and MQTT is connected THEN status SHALL be `healthy` (200); ELSE IF upstream is connected or reconnecting THEN status SHALL be `degraded` (200); ELSE status SHALL be `unhealthy` (503).
 
-**Validates: Requirements 10.3, 10.4, 10.5, 10.6**
+The property test SHALL assert directly that no combination in which the listener is bound and no charger is connected maps to `unhealthy`. That case is the regression this revision exists to prevent.
+
+**Validates: Requirements 10.4, 10.5, 10.6, 10.7, 10.8**
 
 ### Property 10: Configuration validation rejects all invalid inputs
 
@@ -788,7 +857,27 @@ Focus on specific scenarios and edge cases:
 
 ### Test Infrastructure
 
-- **Mock WebSocket server** — Simulates Mobi.e Central System for integration tests
-- **Mock MQTT broker** — Local Mosquitto instance in Docker for integration tests
-- **Testcontainers** — For Docker-based integration test environments
+- **Mock WebSocket server** — Simulates the Mobi.e Central System for integration tests
+- **Mock MQTT broker** — Local Mosquitto instance for integration tests
 - **Tokio test runtime** — `#[tokio::test]` for all async tests with configurable timeouts
+
+### Tests this revision requires
+
+The previous test suite passed at 433/433 while the assembled binary forwarded nothing in either direction, because every test exercised a component in isolation and nothing exercised the wiring. Component coverage is necessary but has been shown to be insufficient here.
+
+1. **End-to-end round trip.** A test that starts the real `main` wiring against a mock Central System and a mock charger, sends a `BootNotification`, and asserts the charger receives the corresponding `CallResult`. This single test is what the current suite most lacks.
+2. **No re-implementation in property tests.** Property tests SHALL call the production code path. Three current tests assert against local copies of the logic — MQTT buffer eviction, connection replacement, and missing-parameter reporting — and would stay green if the production implementation were deleted. Testing a copy of the code proves nothing about the code.
+3. **Egress binding.** A test asserting the upstream socket is bound to `upstream_bind_address`, and that startup fails when that address is absent from every local interface.
+4. **Health semantics.** Explicit assertions that "listening, no charger" is `idle`/200 and never `unhealthy`/503.
+5. **Shutdown terminates.** A test asserting the process exits on SIGTERM within the 10-second budget. The current implementation cannot: the MQTT channel is never closed because the forwarder retains a sender clone, so the join at shutdown blocks forever.
+
+### Deployment Verification
+
+Checks against the running LXC, not the code, recorded in the deployment runbook:
+
+- The dongle enumerates as `wwan0` after a host reboot, and after SIM insertion changes its MAC
+- The host's only default route is on the LAN, before and after the WWAN link comes up
+- Traffic from `upstream_bind_address` egresses `wwan0`, and MQTT traffic does not
+- MSS clamping is applied on the WWAN path
+- The charger's reserved address can reach the proxy's listen port, and other LAN hosts cannot
+- Killing the proxy process results in systemd restarting it, and Home Assistant observing `offline` then `online` on the availability topic

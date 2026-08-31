@@ -3,18 +3,22 @@
 A transparent WebSocket proxy for OCPP 1.6J that bridges EV chargers to a Central System while publishing all OCPP messages to MQTT for Home Assistant integration.
 
 ```
-┌──────────┐         ┌────────────┐         ┌────────────────┐
-│ EV       │◄──WS──►│ OCPP Proxy │◄──WS──►│ Central System │
-│ Charger  │  :9000  │            │         │ (Mobi.e)       │
-└──────────┘         └─────┬──────┘         └────────────────┘
-                           │
-                      MQTT (TLS)
-                           │
-                    ┌──────▼──────┐
-                    │  Mosquitto  │
-                    │ (Home Asst) │
-                    └─────────────┘
+                    Proxmox host (mouraishikawa)
+ ┌──────────┐      ┌──────────────────────────┐        ┌────────────────┐
+ │ EV       │◄─WS─►│  LXC 113  ocpp-proxy     │◄─WSS──►│ Central System │
+ │ Charger  │ :9000│                          │  via   │ (Mobi.e)       │
+ └──────────┘  LAN └────────────┬─────────────┘  APN   └────────────────┘
+                                │              ZTE 4G USB dongle (wwan0)
+                             MQTT │
+                    ┌─────────────▼──────────┐
+                    │ VM 110  Mosquitto      │
+                    │ Home Assistant (HAOS)  │
+                    └────────────────────────┘
 ```
+
+The charger reaches the proxy over the local network. The proxy reaches Mobi.e
+over a mobile APN served by a 4G dongle on the Proxmox host, selected by policy
+routing on the proxy's upstream source address.
 
 ## Features
 
@@ -24,7 +28,7 @@ A transparent WebSocket proxy for OCPP 1.6J that bridges EV chargers to a Centra
 - **Message buffering** — FIFO buffers with configurable limits when destinations are unavailable
 - **Health endpoint** — `GET /health` returns connection states and message counters (HTTP 200/503)
 - **Graceful shutdown** — completes in-flight messages, sends WebSocket close frames, publishes offline status
-- **Mutual TLS** — secure MQTT connection with client certificate authentication
+- **Optional MQTT TLS** — plaintext on the local hop by default; server-auth or mutual TLS when certificates are configured
 - **Structured logging** — JSON logs to stdout with configurable log levels
 
 ## Quick Start
@@ -82,14 +86,16 @@ Configuration uses a layered approach (highest precedence first):
 |-----------|----------|---------|-------------|
 | `central_system_url` | Yes | — | WebSocket URL of the Central System (`ws://` or `wss://`) |
 | `listen_port` | Yes | — | Port for charger WebSocket connections |
+| `listen_address` | No | 0.0.0.0 | Charger-facing bind address |
+| `upstream_bind_address` | No | — | Local source address for the Mobi.e connection; the host's policy route keys on it |
 | `health_port` | No | 8080 | Port for the health check HTTP endpoint |
 | `mqtt.host` | Yes | — | MQTT broker hostname |
 | `mqtt.port` | Yes | — | MQTT broker port (typically 8883 for TLS) |
 | `mqtt.username` | Yes | — | MQTT authentication username |
 | `mqtt.password` | Yes | — | MQTT authentication password |
-| `mqtt.ca_cert_path` | Yes | — | Path to CA certificate for TLS |
-| `mqtt.client_cert_path` | Yes | — | Path to client certificate for mutual TLS |
-| `mqtt.client_key_path` | Yes | — | Path to client private key |
+| `mqtt.ca_cert_path` | No | — | CA certificate. Omit for a plaintext local connection |
+| `mqtt.client_cert_path` | No | — | Client certificate, for mutual TLS |
+| `mqtt.client_key_path` | No | — | Client private key, for mutual TLS |
 | `logging.level` | No | INFO | Log level: DEBUG, INFO, WARNING, ERROR |
 | `buffers.message_buffer_size` | No | 100 | Max OCPP messages buffered per direction |
 | `buffers.mqtt_buffer_size` | No | 500 | Max MQTT messages buffered when broker unreachable |
@@ -139,9 +145,12 @@ Message payloads include a timestamp, message type, and the full original OCPP J
 ```
 
 Health status rules:
-- **Healthy** — upstream, downstream, and MQTT all connected
-- **Degraded** — upstream and downstream connected, MQTT disconnected
-- **Unhealthy** — upstream or downstream not connected
+- **Healthy** — charger connected, upstream and MQTT connected (200)
+- **Idle** — listening, no charger connected (200). The normal state when no
+  vehicle is plugged in; deliberately *not* a fault
+- **Degraded** — upstream reconnecting within its window, or MQTT down (200)
+- **Unhealthy** — not listening, or upstream failed past its reconnection
+  window while a charger is connected (503)
 
 ## Docker
 
@@ -163,15 +172,16 @@ docker run -p 9000:9000 -p 8080:8080 \
 
 The image uses a multi-stage build (Rust 1.82 builder → Debian bookworm-slim runtime) and runs as a non-root user.
 
-## AWS ECS Deployment
+## Deployment
 
-An ECS Fargate task definition is provided in [`deploy/ecs-task-definition.json`](deploy/ecs-task-definition.json). It configures:
+The proxy runs as an unprivileged LXC container on the Proxmox host, supervised
+by systemd, with the 4G dongle owned by the host and reached by policy routing.
+Full provisioning runbook, host networking, and systemd units:
+[`deploy/lxc/`](deploy/lxc/README.md).
 
-- 256 CPU / 512 MB memory
-- Health check via the `/health` endpoint
-- MQTT credentials from AWS Secrets Manager
-- TLS certificates from EFS
-- CloudWatch Logs integration
+> The charger's only path to Mobi.e runs through this container. If the Proxmox
+> host is down, charging and billing stop — see *Availability posture* in
+> [the requirements](.kiro/specs/ocpp-proxy-ha-integration/requirements.md).
 
 ## Development
 
@@ -213,6 +223,7 @@ Key design decisions:
 - MQTT runs on a separate OS thread because rumqttc's EventLoop is `!Send`
 - Messages are forwarded as raw bytes — the proxy never re-serializes JSON
 - Connection replacement: a new charger connection for the same ID closes the existing one
+- Mobi.e egress is bound to a dedicated source address so host policy routing sends it over the APN, while MQTT and health traffic stay on the LAN
 
 ## License
 

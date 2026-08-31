@@ -1,0 +1,11 @@
+# Suppress the ZTE "Zero-CD" mass storage function.
+#
+# The dongle exposes a driver CD-ROM (sr0) and an empty MMC slot (sda) alongside
+# the network function. Neither is wanted on a hypervisor; unbind usb-storage so
+# they do not appear on every boot. The cdc_ether network interface is unaffected.
+#
+# Install to /etc/udev/rules.d/99-zte-no-storage.rules on the Proxmox host.
+
+ACTION=="add", SUBSYSTEM=="usb", DRIVERS=="usb-storage", \
+  ATTRS{idVendor}=="19d2", ATTRS{idProduct}=="1405", \
+  RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/usb-storage/unbind'"

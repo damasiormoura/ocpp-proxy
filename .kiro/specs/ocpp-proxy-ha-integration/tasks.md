@@ -219,12 +219,22 @@ This plan implements an OCPP 1.6J WebSocket proxy in Rust (Tokio) that transpare
 - [x] 10. Implement health check HTTP server
   - [x] 10.1 Implement health check endpoint with axum
     - Serve HTTP endpoint on configurable port (default 8080) at `/health`
-    - Return JSON response within 2 seconds with: status, upstream state, downstream state, mqtt state, uptime_seconds, message counters (forwarded/dropped per direction)
-    - Return HTTP 200 with `healthy` when upstream and downstream are connected
-    - Return HTTP 200 with `degraded` when MQTT is lost but WS connections are active
-    - Return HTTP 503 with `unhealthy` when downstream is lost or both upstream and MQTT are lost
-    - Support AWS ECS/NLB health checks (HTTP 200 when ready)
-    - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.5, 11.8_
+    - Return JSON response within 2 seconds with: status, upstream state, downstream state, mqtt state, wwan reachability, uptime_seconds, message counters
+    - _Requirements: 10.1, 10.2_
+
+  - [ ] 10.3 Correct the health status semantics (REVISED)
+    - Replace the ECS-era rules: "no charger connected" must be `idle`/200, never `unhealthy`/503
+    - `healthy` 200: charger connected, upstream and MQTT connected
+    - `degraded` 200: upstream reconnecting within window, or MQTT down
+    - `unhealthy` 503: listener not bound, or upstream failed past its window while a charger is connected
+    - Add a property assertion that no listening-and-idle combination maps to 503
+    - _Requirements: 10.4, 10.5, 10.6, 10.7, 10.8_
+
+  - [ ] 10.4 Report health from live state
+    - `main.rs` builds a second `ConnectionStateManager` for `HealthState` that nothing ever updates, so `/health` always reports `downstream: disconnected` and zero counters
+    - Share one `Arc<Mutex<ConnectionStateManager>>` between the forwarding path and the health server
+    - Increment message counters on every forward and every drop, both directions
+    - _Requirements: 10.3, 10.9_
 
   - [x] 10.2 Write property test for health response structure
     - **Property 16: Health response contains all required fields**
@@ -232,8 +242,9 @@ This plan implements an OCPP 1.6J WebSocket proxy in Rust (Tokio) that transpare
     - Verify response JSON contains all required fields with correct types
     - **Validates: Requirements 10.2**
 
-- [x] 11. Implement graceful startup and shutdown
-  - [x] 11.1 Implement startup sequence and signal handling
+- [ ] 11. Implement graceful startup and shutdown
+  - [ ] 11.1 Implement startup sequence and signal handling
+    - **Not actually complete.** `graceful_shutdown` is called with `None` for every callback, so it logs a shutdown sequence without performing one. `drop(mqtt_tx)` does not close the channel because the forwarder retains a sender clone, so `mqtt_handle.join()` blocks forever and SIGTERM ends in SIGKILL. Downstream sockets are aborted rather than sent a 1000 close frame.
     - Attempt MQTT connection for up to 10 seconds at startup
     - Begin listening for charger connections regardless of MQTT status
     - Log startup completion and total time to ready state
@@ -244,8 +255,12 @@ This plan implements an OCPP 1.6J WebSocket proxy in Rust (Tokio) that transpare
 - [x] 12. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [x] 13. Wire components together in main and create Dockerfile
-  - [x] 13.1 Wire all components in main.rs
+- [ ] 13. Wire components together in main (NOT COMPLETE — see below)
+  - [ ] 13.1 Wire all components in main.rs
+    - **This was marked done but the proxy does not proxy.** The per-charger upstream task in `main.rs` is a stub that drains its channel into a no-op; nothing ever writes to the upstream WebSocket and nothing reads from it. `UpstreamHandler::{send,recv,reconnect}` and `MessageForwarder::forward_downstream` are dead code, confirmed by compiler dead-code warnings. Buffers are filled but never flushed or expired; `CallTracker` is never cleaned; charger `Close` never reaches the main loop, leaking per-charger state
+    - Rewrite as one task per charger owning both sockets, replacing the single serial main loop
+    - Publish `MqttEvent::StateChange` on every transition — the variant is never constructed, so `ocpp/{id}/status` is never published
+    - Pass the real Charge Point ID to the MQTT publisher; it is currently hard-coded to `"default"`, so every topic is `ocpp/default/...`
     - Load and validate configuration at startup (fail fast with all errors)
     - Initialize structured logging
     - Create shared state (Arc) for connection state manager and metrics
@@ -258,17 +273,65 @@ This plan implements an OCPP 1.6J WebSocket proxy in Rust (Tokio) that transpare
     - Handle graceful shutdown orchestration
     - _Requirements: 7.3, 9.1, 9.2, 9.4, 9.5, 11.3_
 
-  - [x] 13.2 Create Dockerfile and deployment artifacts
-    - Create multi-stage Dockerfile: build with `rust:latest`, runtime with `debian:bookworm-slim` or `distroless`
-    - Ensure compressed image size does not exceed 500 MB
-    - Expose configurable ports for WebSocket and health check
-    - Set entrypoint to the proxy binary
-    - Create sample `config.yaml` with all parameters documented
-    - Create sample ECS task definition JSON referencing the container, NLB, and health check configuration
-    - Ensure container starts and becomes ready within 30 seconds
-    - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.6, 11.7, 11.8_
+  - [x] 13.2 Deployment artifacts for the Proxmox LXC (REVISED — replaces the ECS artifacts)
+    - LXC provisioning runbook, host WWAN networking, watchdog and systemd units in `deploy/lxc/`
+    - ECS task definition removed; Dockerfile retained for development builds only
+    - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5_
 
-- [x] 14. Final checkpoint - Ensure all tests pass
+## Revision: Proxmox LXC deployment
+
+Added when the deployment model moved from AWS ECS to a Proxmox LXC with a 4G
+APN uplink. Tasks 15–17 depend on the fixes in 10.3, 10.4, 11.1 and 13.1.
+
+- [ ] 15. Adapt the application to the new deployment
+  - [ ] 15.1 Add `listen_address` and `upstream_bind_address` configuration
+    - Bind the charger listener to `listen_address` (default `0.0.0.0`)
+    - Bind the upstream socket's local source address to `upstream_bind_address`, so host policy routing sends Mobi.e traffic over the APN
+    - Fail startup if `upstream_bind_address` is not present on any local interface, rather than silently using the default route
+    - _Requirements: 2.7, 2.8, 2.9, 7.4b_
+  - [ ] 15.2 Make MQTT TLS optional
+    - `ca_cert_path`, `client_cert_path`, `client_key_path` become `Option<String>`
+    - None => plaintext; ca only => server-auth TLS; all three => mutual TLS
+    - Remove them from the required-parameter set
+    - _Requirements: 6.6, 6.6a, 6.6b, 7.2_
+  - [ ] 15.3 Honour `max_backoff_seconds`
+    - Currently parsed and ignored; upstream and MQTT both hard-code their maxima
+    - _Requirements: 7.4a_
+  - [ ] 15.4 Move tokio-tungstenite from native-tls to rustls
+    - Drops the OpenSSL build and runtime dependency; matches rumqttc
+    - Verify the binary runs on a bare Debian LXC with no `libssl3`
+  - [ ] 15.5 Report WWAN reachability in the health response
+    - _Requirements: 10.2, 11.11_
+
+- [ ] 16. Report all missing configuration parameters together
+  - `try_deserialize` fails on the first missing field, so only one is ever reported
+  - Deserialize into an all-`Option` shadow struct, then collect every `None`
+  - Strengthen `property_config_missing.rs`, which currently asserts only that *at least one* missing field is named
+  - _Requirements: 7.3_
+
+- [ ] 17. Emit `correlation_id` in structured logs
+  - Requirement 8.5 mandates `component` and `correlation_id` on every entry; `correlation_id` appears nowhere in the source and no spans are ever created
+  - `property_log_format.rs` substitutes `target` for both, so the gap is untested
+  - Create a per-connection span carrying the Charge Point ID and a connection identifier
+  - _Requirements: 8.5_
+
+- [ ] 18. Close the test gaps that let a non-functional binary pass 433 tests
+  - [ ] 18.1 End-to-end round trip through the real `main` wiring against a mock Central System
+  - [ ] 18.2 Replace the three property tests that assert against local re-implementations rather than production code — MQTT buffer eviction, connection replacement, missing-parameter reporting
+  - [ ] 18.3 Test that SIGTERM terminates the process within the 10-second budget
+  - [ ] 18.4 Test the downstream connection-replacement race: the replaced connection's read loop currently removes the *new* connection's entry on exit
+
+- [ ] 19. Host and network provisioning (`deploy/lxc/README.md`)
+  - [ ] 19.1 Pin the dongle to `wwan0` by USB ID before inserting the SIM — the MAC-derived `enx*` name will change once a SIM registers
+  - [ ] 19.2 Insert SIM, set the APN in the dongle's web UI, record its subnet and gateway, fill the config placeholders
+  - [ ] 19.3 Apply host networking: `vmbr2`, `wwan0` static with no default route, policy rule, MASQUERADE, MSS clamp
+  - [ ] 19.4 Install the WWAN watchdog timer
+  - [ ] 19.5 Create LXC 113, update `network/addressing.md` and `proxmox/inventory.md` in the mouraishikawa repo
+  - [ ] 19.6 Give the charger a DHCP reservation and apply the Proxmox firewall rules on LXC 113
+  - [ ] 19.7 **Record the charger's original Mobi.e URL and OCPP settings before repointing it** — the manual bypass in Requirement 11.13 is impossible without them
+  - [ ] 19.8 Confirm whether the Mobi.e hostname resolves publicly or only via APN DNS; add a dnsmasq `server=/<zone>/` entry if needed
+
+- [ ] 14. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes
@@ -279,6 +342,7 @@ This plan implements an OCPP 1.6J WebSocket proxy in Rust (Tokio) that transpare
 - Property tests validate universal correctness properties from the design document using `proptest`
 - Unit tests validate specific examples and edge cases
 - The proxy is stateless by design (Requirement 11.3) — no local state persistence needed
+- **A checked box in this file is not evidence.** Tasks 11 and 13 were marked complete while the assembled binary forwarded nothing in either direction and hung on SIGTERM. Verify against the running system, not the checklist
 - MQTT publishing is entirely asynchronous and decoupled from the forwarding path
 - All buffers have hard capacity limits to prevent unbounded memory growth
 

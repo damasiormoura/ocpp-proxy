@@ -42,6 +42,21 @@ central_system_url: "wss://mobi-e.example.com/ocpp/v16"
 listen_port: 9000
 
 # ------------------------------------------------------------------------------
+# OPTIONAL: Charger-facing bind address (default: 0.0.0.0)
+# ------------------------------------------------------------------------------
+# Set to the LXC's LAN address so the listener is not exposed on the
+# WWAN-egress interface.
+# listen_address: "192.168.50.28"
+
+# ------------------------------------------------------------------------------
+# OPTIONAL: Upstream source address
+# ------------------------------------------------------------------------------
+# Local source address for the Central System connection. Host policy routing
+# keys on this address to send Mobi.e traffic over the 4G APN rather than the
+# LAN default route. Omit for development against a directly reachable server.
+# upstream_bind_address: "10.80.0.2"
+
+# ------------------------------------------------------------------------------
 # OPTIONAL: Health Check Port (default: 8080)
 # ------------------------------------------------------------------------------
 # Port for the HTTP health check endpoint (/health).
@@ -67,9 +82,14 @@ mqtt:
 
   # TLS certificate paths for secure MQTT connection
   # All three are required for mutual TLS authentication
-  ca_cert_path: "/certs/mqtt/ca.pem"
-  client_cert_path: "/certs/mqtt/client.pem"
-  client_key_path: "/certs/mqtt/client-key.pem"
+  # OPTIONAL. The broker is one LAN hop away (Mosquitto on the Home Assistant
+  # VM), not across the internet, so TLS is not required.
+  #   all three omitted  -> plaintext, username/password only
+  #   ca_cert_path only  -> server-authenticated TLS
+  #   all three set      -> mutual TLS
+  # ca_cert_path: "/certs/mqtt/ca.pem"
+  # client_cert_path: "/certs/mqtt/client.pem"
+  # client_key_path: "/certs/mqtt/client-key.pem"
 
 # ------------------------------------------------------------------------------
 # OPTIONAL: Logging Configuration

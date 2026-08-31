@@ -1,0 +1,48 @@
+# OCPP proxy configuration for the Proxmox LXC deployment.
+# Install to /etc/ocpp-proxy/config.yaml (mode 644, root:ocpp).
+# Secrets do NOT go here — see secrets.env.
+
+# --- Mobi.e Central System -------------------------------------------------
+# CONFIRM after the SIM is in: the exact URL Mobi.e issued for this charge
+# point, and whether its hostname resolves through public DNS or only through
+# the APN's resolvers. If only through the APN, add a domain-specific
+# "server=/<zone>/<apn-dns>" entry to the host's existing dnsmasq.
+central_system_url: "wss://__MOBIE_HOST__/ocpp/v16"
+
+# Source address for the upstream socket. The host's policy rule
+# ("ip rule add from 10.80.0.2 lookup 100") keys on exactly this address to
+# send Mobi.e traffic out wwan0. Changing it here without changing the host
+# rule sends Mobi.e traffic over the LAN default route instead — where it
+# cannot reach the APN-only endpoint.
+upstream_bind_address: "10.80.0.2"
+
+# --- Charger-facing listener ----------------------------------------------
+# The charger reaches the proxy over the TP-Link powerline AP on the main LAN.
+# Bound to the LXC's LAN address specifically, so the listener is never exposed
+# on the 10.80.0.0/30 WWAN-egress leg.
+#
+# If the charger is later moved onto the isolated IoT network (see Requirement
+# 12), this becomes the LXC's vmbr1 address and nothing else changes.
+listen_address: "192.168.50.28"
+listen_port: 9000
+
+health_port: 8080
+
+# --- MQTT ------------------------------------------------------------------
+# Mosquitto runs as a Home Assistant add-on on VM 110, one LAN hop away.
+# TLS is optional and omitted here: the previous mutual-TLS requirement existed
+# because the broker was to be reached across the internet from AWS. It is not.
+# To enable TLS later, set ca_cert_path (server-auth) and optionally
+# client_cert_path + client_key_path (mutual).
+mqtt:
+  host: "192.168.50.167"
+  port: 1883
+  # username / password come from secrets.env
+
+logging:
+  level: INFO
+
+buffers:
+  message_buffer_size: 100
+  mqtt_buffer_size: 500
+  max_backoff_seconds: 60
