@@ -20,6 +20,9 @@ fn valid_config_with_files(
     key: &NamedTempFile,
 ) -> ProxyConfig {
     ProxyConfig {
+        listen_address: "0.0.0.0".parse().unwrap(),
+        upstream_bind_address: None,
+        charge_point_id: None,
         central_system_url: "wss://mobi-e.example.com/ocpp".to_string(),
         listen_port: 9000,
         health_port: 8080,
@@ -28,9 +31,9 @@ fn valid_config_with_files(
             port: 8883,
             username: "user".to_string(),
             password: "pass".to_string(),
-            ca_cert_path: ca.path().to_str().unwrap().to_string(),
-            client_cert_path: cert.path().to_str().unwrap().to_string(),
-            client_key_path: key.path().to_str().unwrap().to_string(),
+            ca_cert_path: Some(ca.path().to_str().unwrap().to_string()),
+            client_cert_path: Some(cert.path().to_str().unwrap().to_string()),
+            client_key_path: Some(key.path().to_str().unwrap().to_string()),
         },
         logging: LogConfig {
             level: LogLevel::Info,
@@ -209,7 +212,7 @@ proptest! {
         let key = NamedTempFile::new().unwrap();
         let mut config = valid_config_with_files(&ca, &cert, &key);
 
-        config.mqtt.ca_cert_path = bad_path.clone();
+        config.mqtt.ca_cert_path = Some(bad_path.clone());
 
         let errors = config.validate();
         prop_assert!(
@@ -237,7 +240,7 @@ proptest! {
         let key = NamedTempFile::new().unwrap();
         let mut config = valid_config_with_files(&ca, &cert, &key);
 
-        config.mqtt.client_cert_path = bad_path.clone();
+        config.mqtt.client_cert_path = Some(bad_path.clone());
 
         let errors = config.validate();
         prop_assert!(
@@ -265,7 +268,7 @@ proptest! {
         let key = NamedTempFile::new().unwrap();
         let mut config = valid_config_with_files(&ca, &cert, &key);
 
-        config.mqtt.client_key_path = bad_path.clone();
+        config.mqtt.client_key_path = Some(bad_path.clone());
 
         let errors = config.validate();
         prop_assert!(
@@ -295,6 +298,9 @@ proptest! {
         bad_key_path in nonexistent_path_strategy(),
     ) {
         let config = ProxyConfig {
+            listen_address: "0.0.0.0".parse().unwrap(),
+            upstream_bind_address: None,
+            charge_point_id: None,
             central_system_url: invalid_url,
             listen_port: 0,
             health_port: 0,
@@ -303,9 +309,9 @@ proptest! {
                 port: 0,
                 username: "user".to_string(),
                 password: "pass".to_string(),
-                ca_cert_path: bad_ca_path,
-                client_cert_path: bad_cert_path,
-                client_key_path: bad_key_path,
+                ca_cert_path: Some(bad_ca_path),
+                client_cert_path: Some(bad_cert_path),
+                client_key_path: Some(bad_key_path),
             },
             logging: LogConfig {
                 level: LogLevel::Info,
@@ -361,8 +367,12 @@ proptest! {
     /// **Validates: Requirements 7.5**
     #[test]
     fn prop_valid_config_passes_validation(
-        listen_port in 1u16..=65535u16,
-        health_port in 1u16..=65535u16,
+        // Requirement 1.1 constrains the charger and health ports to the
+        // unprivileged range: the proxy runs as a non-root service and cannot
+        // bind below 1024. The two must also differ, since one process cannot
+        // serve both on the same port.
+        listen_port in 1024u16..=65535u16,
+        health_port in 1024u16..=65535u16,
         mqtt_port in 1u16..=65535u16,
         use_wss in proptest::bool::ANY,
         host in "[a-z]{3,10}\\.[a-z]{2,4}",
@@ -378,6 +388,9 @@ proptest! {
         };
 
         let config = ProxyConfig {
+            listen_address: "0.0.0.0".parse().unwrap(),
+            upstream_bind_address: None,
+            charge_point_id: None,
             central_system_url: url,
             listen_port,
             health_port,
@@ -386,15 +399,17 @@ proptest! {
                 port: mqtt_port,
                 username: "user".to_string(),
                 password: "pass".to_string(),
-                ca_cert_path: ca.path().to_str().unwrap().to_string(),
-                client_cert_path: cert.path().to_str().unwrap().to_string(),
-                client_key_path: key.path().to_str().unwrap().to_string(),
+                ca_cert_path: Some(ca.path().to_str().unwrap().to_string()),
+                client_cert_path: Some(cert.path().to_str().unwrap().to_string()),
+                client_key_path: Some(key.path().to_str().unwrap().to_string()),
             },
             logging: LogConfig {
                 level: LogLevel::Info,
             },
             buffers: BufferConfig::default(),
         };
+
+        prop_assume!(listen_port != health_port);
 
         let errors = config.validate();
         prop_assert!(

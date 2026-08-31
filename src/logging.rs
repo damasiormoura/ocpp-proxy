@@ -59,8 +59,7 @@ fn build_env_filter(level: &LogLevel) -> EnvFilter {
     };
 
     // Allow RUST_LOG env var to override the configured level
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_directive))
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive))
 }
 
 /// Log an OCPP message summary at DEBUG level.
@@ -103,11 +102,7 @@ pub fn log_latency_warning(latency: Duration, unique_id: &str, direction: &str) 
 ///
 /// Satisfies Requirement 8.1: log state changes with previous/new state,
 /// connection identifier, and timestamp.
-pub fn log_connection_state_change(
-    connection_id: &str,
-    previous_state: &str,
-    new_state: &str,
-) {
+pub fn log_connection_state_change(connection_id: &str, previous_state: &str, new_state: &str) {
     tracing::info!(
         component = "state",
         connection_id = connection_id,
@@ -121,12 +116,7 @@ pub fn log_connection_state_change(
 ///
 /// Satisfies Requirement 8.3: log errors at ERROR level including connection
 /// identifier, message unique ID, error category, and description.
-pub fn log_error(
-    category: &str,
-    connection_id: &str,
-    unique_id: Option<&str>,
-    description: &str,
-) {
+pub fn log_error(category: &str, connection_id: &str, unique_id: Option<&str>, description: &str) {
     tracing::error!(
         component = category,
         connection_id = connection_id,
@@ -213,11 +203,6 @@ mod tests {
 
     #[test]
     fn test_log_error_without_unique_id() {
-        log_error(
-            "connection_mqtt",
-            "mqtt",
-            None,
-            "Broker connection timeout",
-        );
+        log_error("connection_mqtt", "mqtt", None, "Broker connection timeout");
     }
 }

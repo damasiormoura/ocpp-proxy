@@ -55,10 +55,7 @@ fn arb_frame_sequence(max_len: usize) -> impl Strategy<Value = Vec<OcppFrame>> {
                 .enumerate()
                 .map(|(i, action)| {
                     let unique_id = format!("msg-{}", i);
-                    let raw = format!(
-                        r#"[2, "{}", "{}", {{"seq": {}}}]"#,
-                        unique_id, action, i
-                    );
+                    let raw = format!(r#"[2, "{}", "{}", {{"seq": {}}}]"#, unique_id, action, i);
                     OcppFrame {
                         raw,
                         message_type: OcppMessageType::Call { action },

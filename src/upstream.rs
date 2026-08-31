@@ -1,523 +1,230 @@
-//! WebSocket client (upstream handler) for the Mobi.e Central System connection.
+//! Connecting to the Mobi.e Central System.
 //!
-//! Maintains the connection to the central system with exponential backoff reconnection.
-//! Implements a 10-second connection timeout and a 5-minute reconnection window before
-//! signaling that the downstream connection should be closed.
+//! This module only opens the connection. Reconnection, backoff and the
+//! five-minute window that decides when to give up all live in `session`,
+//! which owns both sockets and is the only place that can act on an upstream
+//! failure.
+//!
+//! An earlier `UpstreamHandler` struct held a connection plus `send`, `recv`
+//! and `reconnect` methods. Nothing ever called them — the compiler said so —
+//! and its presence made the proxy look finished while no bytes moved.
 
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
-use tracing::{debug, error, info, warn};
+use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
 use crate::error::ProxyError;
-use crate::models::{ConnectionId, ConnectionState, ExponentialBackoff, OcppFrame};
-use crate::state::ConnectionStateManager;
 
-/// Default connection timeout (10 seconds).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Maximum duration to attempt reconnection before giving up (5 minutes).
-const MAX_RECONNECT_DURATION: Duration = Duration::from_secs(300);
-
-/// Default initial backoff delay for reconnection (2 seconds).
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
-
-/// Default maximum backoff delay for reconnection (60 seconds).
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-/// The OCPP 1.6J WebSocket subprotocol identifier.
-const OCPP_SUBPROTOCOL: &str = "ocpp1.6";
-
-/// Upstream WebSocket client for the Central System connection.
+/// Default connection timeout (10 seconds), per Requirement 2.4.
 ///
-/// Manages the lifecycle of the upstream connection including initial connection,
-/// message sending/receiving, reconnection with exponential backoff, and state
-/// transitions communicated through the state manager.
-pub struct UpstreamHandler {
-    /// The base URL of the Central System (without the Charge Point ID path).
-    central_system_url: Url,
-    /// The Charge Point ID to append to the connection URL path.
-    charge_point_id: String,
-    /// The WebSocket subprotocol to forward (received from the charger).
-    subprotocol: String,
-    /// The active WebSocket connection, if any.
-    connection: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    /// Current connection state.
-    state: ConnectionState,
-    /// Exponential backoff strategy for reconnection attempts.
-    reconnect_strategy: ExponentialBackoff,
+/// Sessions pass their configured timeout explicitly; this is the reference
+/// value the tests assert against.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Build the full upstream URL: `{base_url}/{charge_point_id}`.
+///
+/// Requirement 2.2 — the Charge Point ID the charger presented is mirrored
+/// into the Central System URL path unchanged.
+pub fn build_upstream_url(base_url: &Url, charge_point_id: &str) -> Url {
+    let mut url = base_url.clone();
+    let mut path = url.path().to_string();
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(charge_point_id);
+    url.set_path(&path);
+    url
 }
 
-impl UpstreamHandler {
-    /// Create a new `UpstreamHandler`.
-    ///
-    /// # Arguments
-    /// * `central_system_url` - Base URL of the Central System (e.g., `wss://cs.mobi-e.pt`)
-    /// * `charge_point_id` - The Charge Point ID to use in the connection path
-    /// * `subprotocol` - The WebSocket subprotocol to negotiate (typically `ocpp1.6`)
-    pub fn new(central_system_url: Url, charge_point_id: String, subprotocol: String) -> Self {
-        Self {
-            central_system_url,
-            charge_point_id,
-            subprotocol,
-            connection: None,
-            state: ConnectionState::Disconnected,
-            reconnect_strategy: ExponentialBackoff::with_defaults(
-                DEFAULT_INITIAL_BACKOFF,
-                DEFAULT_MAX_BACKOFF,
-            ),
-        }
-    }
-
-    /// Build the full connection URL: `{central_system_url}/{charge_point_id}`.
-    pub fn build_connection_url(&self) -> Url {
-        let mut url = self.central_system_url.clone();
-        // Ensure the path ends with '/' before appending charge_point_id
-        let mut path = url.path().to_string();
-        if !path.ends_with('/') {
-            path.push('/');
-        }
-        path.push_str(&self.charge_point_id);
-        url.set_path(&path);
-        url
-    }
-
-    /// Connect to the Central System with a 10-second timeout.
-    ///
-    /// Emits `Connecting` → `Connected` state transitions on success,
-    /// or `Connecting` → `Disconnected` on failure.
-    pub async fn connect(
-        &mut self,
-        state_manager: &mut ConnectionStateManager,
-    ) -> Result<(), ProxyError> {
-        let url = self.build_connection_url();
-        info!(
-            charge_point_id = %self.charge_point_id,
-            url = %url,
-            "Connecting to Central System"
-        );
-
-        self.transition_state(ConnectionState::Connecting, state_manager);
-
-        match self.establish_connection(&url).await {
-            Ok(ws_stream) => {
-                self.connection = Some(ws_stream);
-                self.transition_state(ConnectionState::Connected, state_manager);
-                self.reconnect_strategy.reset();
-                info!(
-                    charge_point_id = %self.charge_point_id,
-                    "Connected to Central System"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                self.transition_state(ConnectionState::Disconnected, state_manager);
-                error!(
-                    charge_point_id = %self.charge_point_id,
-                    error = %e,
-                    "Failed to connect to Central System"
-                );
-                Err(e)
-            }
-        }
-    }
-
-    /// Receive the next text message from the Central System.
-    ///
-    /// Returns an `OcppFrame` parsed from the received text message.
-    /// Returns an error if the connection is closed or a non-text message is received.
-    pub async fn recv(&mut self) -> Result<OcppFrame, ProxyError> {
-        let ws = self.connection.as_mut().ok_or_else(|| {
-            ProxyError::ConnectionUpstream {
-                description: "No active upstream connection".to_string(),
-            }
-        })?;
-
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    debug!(
-                        charge_point_id = %self.charge_point_id,
-                        "Received message from Central System"
-                    );
-                    return OcppFrame::parse(&text);
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    // Respond to pings automatically (tungstenite handles this,
-                    // but we consume the message from the stream)
-                    debug!("Received ping from Central System");
-                    if let Err(e) = ws.send(Message::Pong(data)).await {
-                        return Err(ProxyError::ConnectionUpstream {
-                            description: format!("Failed to send pong: {}", e),
-                        });
-                    }
-                }
-                Some(Ok(Message::Pong(_))) => {
-                    debug!("Received pong from Central System");
-                    continue;
-                }
-                Some(Ok(Message::Close(_))) => {
-                    info!(
-                        charge_point_id = %self.charge_point_id,
-                        "Central System closed the connection"
-                    );
-                    self.connection = None;
-                    return Err(ProxyError::ConnectionUpstream {
-                        description: "Central System closed the connection".to_string(),
-                    });
-                }
-                Some(Ok(Message::Binary(_))) => {
-                    warn!("Received unexpected binary message from Central System, ignoring");
-                    continue;
-                }
-                Some(Ok(Message::Frame(_))) => {
-                    continue;
-                }
-                Some(Err(e)) => {
-                    error!(
-                        charge_point_id = %self.charge_point_id,
-                        error = %e,
-                        "WebSocket error on upstream connection"
-                    );
-                    self.connection = None;
-                    return Err(ProxyError::ConnectionUpstream {
-                        description: format!("WebSocket error: {}", e),
-                    });
-                }
-                None => {
-                    info!(
-                        charge_point_id = %self.charge_point_id,
-                        "Upstream WebSocket stream ended"
-                    );
-                    self.connection = None;
-                    return Err(ProxyError::ConnectionUpstream {
-                        description: "Upstream stream ended".to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    /// Send a text message (raw OCPP frame) to the Central System.
-    pub async fn send(&mut self, frame: &OcppFrame) -> Result<(), ProxyError> {
-        let ws = self.connection.as_mut().ok_or_else(|| {
-            ProxyError::ConnectionUpstream {
-                description: "No active upstream connection".to_string(),
-            }
-        })?;
-
-        debug!(
-            charge_point_id = %self.charge_point_id,
-            unique_id = %frame.unique_id,
-            "Sending message to Central System"
-        );
-
-        ws.send(Message::Text(frame.raw.clone().into())).await.map_err(|e| {
-            ProxyError::ConnectionUpstream {
-                description: format!("Failed to send message: {}", e),
-            }
-        })
-    }
-
-    /// Close the upstream connection gracefully with the given close code.
-    pub async fn close(&mut self, code: CloseCode) -> Result<(), ProxyError> {
-        if let Some(ref mut ws) = self.connection {
-            let close_frame = CloseFrame {
-                code,
-                reason: "Proxy closing connection".into(),
-            };
-            if let Err(e) = ws.send(Message::Close(Some(close_frame))).await {
-                warn!(
-                    charge_point_id = %self.charge_point_id,
-                    error = %e,
-                    "Error sending close frame to Central System"
-                );
-            }
-        }
-        self.connection = None;
-        self.state = ConnectionState::Disconnected;
-        info!(
-            charge_point_id = %self.charge_point_id,
-            "Upstream connection closed"
-        );
-        Ok(())
-    }
-
-    /// Get the current connection state.
-    pub fn state(&self) -> ConnectionState {
-        self.state
-    }
-
-    /// Attempt reconnection with exponential backoff.
-    ///
-    /// Retries indefinitely within a 5-minute window. If reconnection succeeds,
-    /// state transitions to `Connected`. If the 5-minute window elapses without
-    /// success, returns an error indicating downstream should be closed with code 1001.
-    pub async fn reconnect(
-        &mut self,
-        state_manager: &mut ConnectionStateManager,
-    ) -> Result<(), ProxyError> {
-        self.transition_state(ConnectionState::Reconnecting, state_manager);
-        self.reconnect_strategy.reset();
-
-        let url = self.build_connection_url();
-        let start = tokio::time::Instant::now();
-
-        info!(
-            charge_point_id = %self.charge_point_id,
-            max_duration_secs = MAX_RECONNECT_DURATION.as_secs(),
-            "Starting upstream reconnection attempts"
-        );
-
-        loop {
-            let elapsed = start.elapsed();
-            if elapsed >= MAX_RECONNECT_DURATION {
-                error!(
-                    charge_point_id = %self.charge_point_id,
-                    elapsed_secs = elapsed.as_secs(),
-                    "Reconnection window expired, downstream should be closed with 1001"
-                );
-                self.transition_state(ConnectionState::Disconnected, state_manager);
-                return Err(ProxyError::ConnectionUpstream {
-                    description: format!(
-                        "Upstream reconnection failed after {} seconds; close downstream with 1001",
-                        elapsed.as_secs()
-                    ),
-                });
-            }
-
-            let delay = self.reconnect_strategy.next_delay();
-            // Don't wait longer than the remaining reconnection window
-            let remaining = MAX_RECONNECT_DURATION.saturating_sub(elapsed);
-            let actual_delay = delay.min(remaining);
-
-            debug!(
-                charge_point_id = %self.charge_point_id,
-                delay_ms = actual_delay.as_millis(),
-                "Waiting before reconnection attempt"
-            );
-
-            tokio::time::sleep(actual_delay).await;
-
-            info!(
-                charge_point_id = %self.charge_point_id,
-                url = %url,
-                "Attempting upstream reconnection"
-            );
-
-            match self.establish_connection(&url).await {
-                Ok(ws_stream) => {
-                    self.connection = Some(ws_stream);
-                    self.transition_state(ConnectionState::Connected, state_manager);
-                    self.reconnect_strategy.reset();
-                    info!(
-                        charge_point_id = %self.charge_point_id,
-                        elapsed_secs = start.elapsed().as_secs(),
-                        "Upstream reconnection successful"
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        charge_point_id = %self.charge_point_id,
-                        error = %e,
-                        "Upstream reconnection attempt failed"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Establish a WebSocket connection to the given URL with timeout and subprotocol.
-    async fn establish_connection(
-        &self,
-        url: &Url,
-    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ProxyError> {
-        let mut request = url.as_str().into_client_request().map_err(|e| {
-            ProxyError::ConnectionUpstream {
+/// Connect to the Central System, returning the raw WebSocket stream.
+///
+/// The session splits this into sink and stream halves so it can read from the
+/// Central System and write to it concurrently.
+///
+/// `bind_address` selects the local source address. It is unnecessary when the
+/// Central System is reached by a destination route — which is the case for
+/// the Mobi.e APN — and is provided for deployments that must select egress by
+/// source address instead.
+pub async fn connect_upstream(
+    url: &Url,
+    subprotocol: &str,
+    bind_address: Option<IpAddr>,
+    connect_timeout: Duration,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ProxyError> {
+    let mut request =
+        url.as_str()
+            .into_client_request()
+            .map_err(|e| ProxyError::ConnectionUpstream {
                 description: format!("Failed to build WebSocket request: {}", e),
-            }
-        })?;
+            })?;
 
-        // Set the Sec-WebSocket-Protocol header with the subprotocol
-        request.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            HeaderValue::from_str(&self.subprotocol).map_err(|e| {
-                ProxyError::ConnectionUpstream {
-                    description: format!("Invalid subprotocol header value: {}", e),
-                }
-            })?,
-        );
+    // Requirement 2.3 — mirror the subprotocol the charger negotiated.
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_str(subprotocol).map_err(|e| ProxyError::ConnectionUpstream {
+            description: format!("Invalid subprotocol header value: {}", e),
+        })?,
+    );
 
-        let connect_future = connect_async_tls_with_config(request, None, false, None);
-
-        let (ws_stream, response) =
-            timeout(CONNECT_TIMEOUT, connect_future)
+    let connect = async {
+        match bind_address {
+            None => connect_async_tls_with_config(request, None, false, None)
                 .await
-                .map_err(|_| ProxyError::ConnectionUpstream {
-                    description: format!(
-                        "Connection timed out after {} seconds",
-                        CONNECT_TIMEOUT.as_secs()
-                    ),
-                })?
+                .map(|(stream, _response)| stream)
                 .map_err(|e| ProxyError::ConnectionUpstream {
                     description: format!("WebSocket connection failed: {}", e),
-                })?;
+                }),
+            Some(bind) => {
+                // Binding a source address means we own the TCP connect, so
+                // the target has to be resolved here rather than inside
+                // tokio-tungstenite.
+                let stream = connect_bound(url, bind).await?;
+                tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
+                    .await
+                    .map(|(stream, _response)| stream)
+                    .map_err(|e| ProxyError::ConnectionUpstream {
+                        description: format!("WebSocket connection failed: {}", e),
+                    })
+            }
+        }
+    };
 
-        debug!(
-            status = %response.status(),
-            "Upstream WebSocket handshake completed"
-        );
+    timeout(connect_timeout, connect)
+        .await
+        .map_err(|_| ProxyError::ConnectionUpstream {
+            description: format!(
+                "Connection timed out after {} seconds",
+                connect_timeout.as_secs()
+            ),
+        })?
+}
 
-        Ok(ws_stream)
-    }
+/// Open a TCP connection from a specific local source address.
+async fn connect_bound(url: &Url, bind: IpAddr) -> Result<TcpStream, ProxyError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ProxyError::ConnectionUpstream {
+            description: "Central System URL has no host".to_string(),
+        })?;
+    let port = url.port_or_known_default().unwrap_or(80);
 
-    /// Update internal state and emit the transition through the state manager.
-    fn transition_state(
-        &mut self,
-        new_state: ConnectionState,
-        state_manager: &mut ConnectionStateManager,
-    ) {
-        if self.state != new_state {
-            debug!(
-                charge_point_id = %self.charge_point_id,
-                previous = ?self.state,
-                current = ?new_state,
-                "Upstream state transition"
-            );
-            self.state = new_state;
-            state_manager.transition(ConnectionId::Upstream, new_state);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| ProxyError::ConnectionUpstream {
+            description: format!("Failed to resolve '{}': {}", host, e),
+        })?
+        .collect();
+
+    // Only try targets of the same address family as the bind address; a v4
+    // socket cannot connect to a v6 peer and the error would be obscure.
+    let mut last_err = None;
+    for addr in addrs.iter().filter(|a| a.is_ipv4() == bind.is_ipv4()) {
+        let socket = if bind.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        }
+        .map_err(|e| ProxyError::ConnectionUpstream {
+            description: format!("Failed to create socket: {}", e),
+        })?;
+
+        socket
+            .bind(SocketAddr::new(bind, 0))
+            .map_err(|e| ProxyError::ConnectionUpstream {
+                description: format!("Failed to bind upstream socket to {}: {}", bind, e),
+            })?;
+
+        match socket.connect(*addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
         }
     }
 
-    /// Check if the upstream connection is currently active.
-    pub fn is_connected(&self) -> bool {
-        self.state == ConnectionState::Connected && self.connection.is_some()
-    }
-
-    /// Get the Charge Point ID associated with this upstream handler.
-    pub fn charge_point_id(&self) -> &str {
-        &self.charge_point_id
-    }
+    Err(ProxyError::ConnectionUpstream {
+        description: match last_err {
+            Some(e) => format!("Failed to connect to '{}': {}", host, e),
+            None => format!("No address for '{}' matching bind family {}", host, bind),
+        },
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ExponentialBackoff;
 
     #[test]
-    fn test_build_connection_url_basic() {
-        let handler = UpstreamHandler::new(
-            Url::parse("wss://cs.mobi-e.pt").unwrap(),
-            "CP001".to_string(),
-            OCPP_SUBPROTOCOL.to_string(),
-        );
-        let url = handler.build_connection_url();
+    fn test_build_upstream_url_basic() {
+        let url = build_upstream_url(&Url::parse("wss://cs.mobi-e.pt").unwrap(), "CP001");
         assert_eq!(url.as_str(), "wss://cs.mobi-e.pt/CP001");
     }
 
     #[test]
-    fn test_build_connection_url_with_trailing_slash() {
-        let handler = UpstreamHandler::new(
-            Url::parse("wss://cs.mobi-e.pt/").unwrap(),
-            "CP001".to_string(),
-            OCPP_SUBPROTOCOL.to_string(),
-        );
-        let url = handler.build_connection_url();
+    fn test_build_upstream_url_with_trailing_slash() {
+        let url = build_upstream_url(&Url::parse("wss://cs.mobi-e.pt/").unwrap(), "CP001");
         assert_eq!(url.as_str(), "wss://cs.mobi-e.pt/CP001");
     }
 
     #[test]
-    fn test_build_connection_url_with_path() {
-        let handler = UpstreamHandler::new(
-            Url::parse("wss://cs.mobi-e.pt/ocpp").unwrap(),
-            "CHARGE_POINT_42".to_string(),
-            OCPP_SUBPROTOCOL.to_string(),
+    fn test_build_upstream_url_with_path() {
+        let url = build_upstream_url(
+            &Url::parse("wss://cs.mobi-e.pt/ocpp").unwrap(),
+            "CHARGE_POINT_42",
         );
-        let url = handler.build_connection_url();
         assert_eq!(url.as_str(), "wss://cs.mobi-e.pt/ocpp/CHARGE_POINT_42");
     }
 
     #[test]
-    fn test_build_connection_url_with_port() {
-        let handler = UpstreamHandler::new(
-            Url::parse("ws://localhost:8080").unwrap(),
-            "test-cp".to_string(),
-            OCPP_SUBPROTOCOL.to_string(),
-        );
-        let url = handler.build_connection_url();
+    fn test_build_upstream_url_with_port() {
+        let url = build_upstream_url(&Url::parse("ws://localhost:8080").unwrap(), "test-cp");
         assert_eq!(url.as_str(), "ws://localhost:8080/test-cp");
     }
 
+    /// The real Mobi.e endpoint shape: a plaintext private address with a
+    /// versioned path, and the Charge Point ID appended unchanged.
     #[test]
-    fn test_build_connection_url_preserves_charge_point_id() {
-        let id = "PT-MOB-CP-12345-AB";
-        let handler = UpstreamHandler::new(
-            Url::parse("wss://central-system.example.com").unwrap(),
-            id.to_string(),
-            OCPP_SUBPROTOCOL.to_string(),
+    fn test_build_upstream_url_matches_the_mobie_endpoint() {
+        let url = build_upstream_url(
+            &Url::parse("ws://10.200.10.200/ocpp/1.6").unwrap(),
+            "MOBI-ALM-00058",
         );
-        let url = handler.build_connection_url();
-        assert!(url.as_str().ends_with(id));
+        assert_eq!(url.as_str(), "ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058");
     }
 
+    /// Requirement 2.2 — the ID is mirrored verbatim, whatever it contains.
     #[test]
-    fn test_initial_state_is_disconnected() {
-        let handler = UpstreamHandler::new(
-            Url::parse("wss://cs.mobi-e.pt").unwrap(),
-            "CP001".to_string(),
-            OCPP_SUBPROTOCOL.to_string(),
-        );
-        assert_eq!(handler.state(), ConnectionState::Disconnected);
-        assert!(!handler.is_connected());
-    }
-
-    #[test]
-    fn test_charge_point_id_accessor() {
-        let handler = UpstreamHandler::new(
-            Url::parse("wss://cs.mobi-e.pt").unwrap(),
-            "MY_CHARGER".to_string(),
-            OCPP_SUBPROTOCOL.to_string(),
-        );
-        assert_eq!(handler.charge_point_id(), "MY_CHARGER");
-    }
-
-    #[test]
-    fn test_backoff_configuration() {
-        let handler = UpstreamHandler::new(
-            Url::parse("wss://cs.mobi-e.pt").unwrap(),
-            "CP001".to_string(),
-            OCPP_SUBPROTOCOL.to_string(),
-        );
-        // Verify the backoff strategy is configured with correct defaults
-        assert_eq!(handler.reconnect_strategy.initial, Duration::from_secs(2));
-        assert_eq!(handler.reconnect_strategy.max, Duration::from_secs(60));
-        assert_eq!(handler.reconnect_strategy.multiplier, 2.0);
+    fn test_build_upstream_url_preserves_charge_point_id() {
+        for id in [
+            "PT-MOB-CP-12345-AB",
+            "MOBI-ALM-00058",
+            "lowercase-id",
+            "ID_WITH_UNDERSCORES",
+            "1234567890",
+        ] {
+            let url =
+                build_upstream_url(&Url::parse("wss://central-system.example.com").unwrap(), id);
+            assert!(url.as_str().ends_with(id), "{} should end with {}", url, id);
+        }
     }
 
     #[test]
     fn test_backoff_sequence_matches_requirements() {
-        let mut backoff = ExponentialBackoff::with_defaults(
-            DEFAULT_INITIAL_BACKOFF,
-            DEFAULT_MAX_BACKOFF,
-        );
-        // Per requirement 2.4: exponential backoff starting at 2s, doubling, max 60s
+        // Requirement 2.4: start at 2s, double, cap at 60s.
+        let mut backoff =
+            ExponentialBackoff::with_defaults(Duration::from_secs(2), Duration::from_secs(60));
         assert_eq!(backoff.next_delay(), Duration::from_secs(2));
         assert_eq!(backoff.next_delay(), Duration::from_secs(4));
         assert_eq!(backoff.next_delay(), Duration::from_secs(8));
         assert_eq!(backoff.next_delay(), Duration::from_secs(16));
         assert_eq!(backoff.next_delay(), Duration::from_secs(32));
-        assert_eq!(backoff.next_delay(), Duration::from_secs(60)); // capped at max
-        assert_eq!(backoff.next_delay(), Duration::from_secs(60)); // stays at max
+        assert_eq!(backoff.next_delay(), Duration::from_secs(60));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(60));
     }
 
     #[test]
@@ -525,8 +232,23 @@ mod tests {
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
     }
 
-    #[test]
-    fn test_max_reconnect_duration_constant() {
-        assert_eq!(MAX_RECONNECT_DURATION, Duration::from_secs(300));
+    /// Connecting to a closed port fails inside the timeout rather than
+    /// hanging, so a session can move on to its backoff.
+    #[tokio::test]
+    async fn test_connect_upstream_fails_fast_on_closed_port() {
+        let url = Url::parse("ws://127.0.0.1:1/ocpp").unwrap();
+        let result = connect_upstream(&url, "ocpp1.6", None, Duration::from_secs(2)).await;
+        assert!(result.is_err());
+    }
+
+    /// A bind address that is not local must fail with a clear message rather
+    /// than silently falling back to the default route — which, for an
+    /// APN-only endpoint, would be a connection that can never succeed.
+    #[tokio::test]
+    async fn test_connect_upstream_rejects_unusable_bind_address() {
+        let url = Url::parse("ws://127.0.0.1:1/ocpp").unwrap();
+        let bind = Some("203.0.113.99".parse().unwrap());
+        let result = connect_upstream(&url, "ocpp1.6", bind, Duration::from_secs(2)).await;
+        assert!(result.is_err(), "binding to a non-local address must fail");
     }
 }

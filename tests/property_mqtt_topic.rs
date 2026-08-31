@@ -24,7 +24,10 @@ fn valid_charge_point_id() -> impl Strategy<Value = String> {
 ///
 /// Per the spec, direction is either "charger" or "central_system".
 fn valid_direction() -> impl Strategy<Value = String> {
-    prop_oneof![Just("charger".to_string()), Just("central_system".to_string()),]
+    prop_oneof![
+        Just("charger".to_string()),
+        Just("central_system".to_string()),
+    ]
 }
 
 /// Strategy to generate valid OCPP action names.

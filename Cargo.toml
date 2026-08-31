@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 tokio = { version = "1.45.0", features = ["full"] }
 tokio-util = { version = "0.7.13", features = ["rt"] }
-tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-webpki-roots"] }
 axum = { version = "0.8.4", features = ["ws"] }
 futures-util = "0.3.31"
 rumqttc = { version = "0.24.0", features = ["use-rustls"] }

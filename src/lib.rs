@@ -6,6 +6,7 @@ pub mod health;
 pub mod logging;
 pub mod models;
 pub mod mqtt;
+pub mod session;
 pub mod shutdown;
 pub mod state;
 pub mod upstream;

@@ -7,39 +7,41 @@
 //! Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::{
-    Router,
+    extract::ws::WebSocket,
     extract::{Path, State, WebSocketUpgrade},
-    extract::ws::{Message, WebSocket},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
+    Router,
 };
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
-use crate::error::ProxyError;
+use crate::forwarder::MqttEvent;
 use crate::models::{ConnectionId, ConnectionState};
+use crate::session::{self, SessionConfig};
 use crate::state::ConnectionStateManager;
 
 /// The required OCPP 1.6J WebSocket subprotocol identifier.
 pub const OCPP16_SUBPROTOCOL: &str = "ocpp1.6";
 
-/// Timeout for completing the WebSocket handshake.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Represents an active downstream connection with its message channels.
-#[derive(Debug)]
+/// Represents an active downstream connection.
+#[derive(Debug, Clone)]
 pub struct ActiveConnection {
-    /// Sender to push messages TO the charger (used by forwarder).
-    pub tx: mpsc::Sender<Message>,
-    /// Handle to abort the connection task when replacing.
-    pub abort_handle: tokio::task::AbortHandle,
+    /// Monotonic id for this connection.
+    ///
+    /// Registry cleanup is guarded on this value. Without it, a replaced
+    /// connection's task removes the map entry belonging to the connection
+    /// that replaced it, silently deregistering a live charger and marking
+    /// downstream disconnected while it is still connected.
+    pub generation: u64,
+    /// Cancels the session task owning this connection.
+    pub cancel: CancellationToken,
 }
 
 /// Shared state for the downstream WebSocket server.
@@ -49,9 +51,14 @@ pub struct DownstreamState {
     pub connections: Arc<Mutex<HashMap<String, ActiveConnection>>>,
     /// Connection state manager for emitting state transitions.
     pub state_manager: Arc<Mutex<ConnectionStateManager>>,
-    /// Channel to send received messages FROM chargers to the forwarder.
-    /// The tuple contains (charge_point_id, message).
-    pub message_tx: mpsc::Sender<(String, Message)>,
+    /// Configuration handed to each session.
+    pub session_config: Arc<SessionConfig>,
+    /// Channel to the MQTT publisher.
+    pub mqtt_tx: mpsc::Sender<MqttEvent>,
+    /// Cancelled when the proxy is shutting down.
+    pub shutdown: CancellationToken,
+    /// Source of connection generations.
+    pub generation: Arc<AtomicU64>,
 }
 
 /// Validates the `Sec-WebSocket-Protocol` header for the OCPP 1.6 subprotocol.
@@ -79,36 +86,6 @@ pub fn create_router(state: DownstreamState) -> Router {
     Router::new()
         .route("/{charge_point_id}", get(ws_upgrade_handler))
         .with_state(state)
-}
-
-/// Starts the downstream WebSocket server on the given address.
-///
-/// This function runs indefinitely, accepting charger connections.
-pub async fn start_server(
-    addr: SocketAddr,
-    state: DownstreamState,
-) -> Result<(), ProxyError> {
-    let router = create_router(state);
-
-    info!(
-        component = "downstream",
-        addr = %addr,
-        "Starting downstream WebSocket server"
-    );
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| ProxyError::ConnectionDownstream {
-            description: format!("Failed to bind downstream server: {}", e),
-        })?;
-
-    axum::serve(listener, router)
-        .await
-        .map_err(|e| ProxyError::ConnectionDownstream {
-            description: format!("Downstream server error: {}", e),
-        })?;
-
-    Ok(())
 }
 
 /// Handler for WebSocket upgrade requests.
@@ -167,195 +144,121 @@ async fn ws_upgrade_handler(
     let cp_id = charge_point_id.clone();
 
     ws.protocols([OCPP16_SUBPROTOCOL])
-        .on_upgrade(move |socket| {
-            handle_connection_with_timeout(socket, cp_id, state_clone)
-        })
+        .on_upgrade(move |socket| handle_connection(socket, cp_id, state_clone))
         .into_response()
 }
 
-/// Wraps `handle_connection` with a handshake timeout.
+/// Register a connection, displacing any existing one for the same Charge
+/// Point ID (Requirement 1.4).
 ///
-/// If the initial setup takes longer than `HANDSHAKE_TIMEOUT`, the connection
-/// is dropped.
-async fn handle_connection_with_timeout(
-    socket: WebSocket,
-    charge_point_id: String,
-    state: DownstreamState,
-) {
-    let result = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        setup_connection(socket, charge_point_id.clone(), state.clone()),
-    )
-    .await;
+/// Returns the generation assigned to the new connection. The displaced
+/// connection's token is cancelled, which makes its session send a close frame
+/// and unwind.
+pub async fn register_connection(
+    state: &DownstreamState,
+    charge_point_id: &str,
+    cancel: CancellationToken,
+) -> u64 {
+    let generation = state.generation.fetch_add(1, Ordering::SeqCst);
 
-    match result {
-        Ok(Some((ws_receiver, tx))) => {
-            // Connection established, now run the read loop (no timeout for this part)
-            run_read_loop(ws_receiver, charge_point_id, state, tx).await;
+    let mut connections = state.connections.lock().await;
+    if let Some(existing) = connections.insert(
+        charge_point_id.to_string(),
+        ActiveConnection { generation, cancel },
+    ) {
+        warn!(
+            component = "downstream",
+            charge_point_id = %charge_point_id,
+            replaced_generation = existing.generation,
+            generation = generation,
+            "Replacing existing connection for this Charge Point"
+        );
+        existing.cancel.cancel();
+    }
+
+    generation
+}
+
+/// Deregister a connection, but only if it is still the current one.
+///
+/// Returns whether the entry was removed. The generation check is the whole
+/// point: a displaced session finishes *after* its replacement has registered,
+/// and an unguarded removal would deregister the live charger, marking
+/// downstream disconnected while it is still connected.
+pub async fn deregister_connection(
+    state: &DownstreamState,
+    charge_point_id: &str,
+    generation: u64,
+) -> bool {
+    let mut connections = state.connections.lock().await;
+    match connections.get(charge_point_id) {
+        Some(active) if active.generation == generation => {
+            connections.remove(charge_point_id);
+            true
         }
-        Ok(None) => {
-            // Setup failed (logged internally)
-        }
-        Err(_) => {
-            error!(
-                component = "downstream",
-                charge_point_id = %charge_point_id,
-                "WebSocket handshake timed out ({}s)",
-                HANDSHAKE_TIMEOUT.as_secs()
-            );
-            // Emit Disconnected state on timeout
-            let mut mgr = state.state_manager.lock().await;
-            mgr.transition(ConnectionId::Downstream, ConnectionState::Disconnected);
-        }
+        _ => false,
     }
 }
 
-/// Sets up the connection: splits the socket, registers it, replaces existing connections.
-///
-/// Returns the receiver half and the sender channel on success, or None on failure.
-async fn setup_connection(
-    socket: WebSocket,
-    charge_point_id: String,
-    state: DownstreamState,
-) -> Option<(futures_util::stream::SplitStream<WebSocket>, mpsc::Sender<Message>)> {
-    let (ws_sender, ws_receiver) = socket.split();
+/// Registers the connection, replacing any existing one for the same Charge
+/// Point ID, then runs the proxy session until it ends.
+async fn handle_connection(socket: WebSocket, charge_point_id: String, state: DownstreamState) {
+    let cancel = state.shutdown.child_token();
+    let generation = register_connection(&state, &charge_point_id, cancel.clone()).await;
 
-    // Create a channel for sending messages TO this charger
-    let (tx, rx) = mpsc::channel::<Message>(64);
-
-    // Spawn a task to forward messages from the channel to the WebSocket
-    let send_task = tokio::spawn(forward_to_websocket(ws_sender, rx));
-    let abort_handle = send_task.abort_handle();
-
-    // Replace existing connection for this Charge Point ID
-    {
-        let mut connections = state.connections.lock().await;
-        if let Some(existing) = connections.remove(&charge_point_id) {
-            warn!(
-                component = "downstream",
-                charge_point_id = %charge_point_id,
-                "Replacing existing connection for Charge Point"
-            );
-            // Send close frame to existing connection before aborting
-            let _ = existing
-                .tx
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1000,
-                    reason: "New connection replacing existing one".into(),
-                })))
-                .await;
-            // Give a moment for the close frame to be sent
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            existing.abort_handle.abort();
-        }
-
-        connections.insert(
-            charge_point_id.clone(),
-            ActiveConnection {
-                tx: tx.clone(),
-                abort_handle,
-            },
-        );
-    }
-
-    // Emit Connected state
-    {
+    let (upstream, downstream) = {
         let mut mgr = state.state_manager.lock().await;
         mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
-    }
+        (mgr.upstream_state(), mgr.downstream_state())
+    };
+    session::publish_status(&state.mqtt_tx, &charge_point_id, upstream, downstream);
 
     info!(
         component = "downstream",
         charge_point_id = %charge_point_id,
+        generation = generation,
         "Charger connected"
     );
 
-    Some((ws_receiver, tx))
-}
+    session::run_session(
+        charge_point_id.clone(),
+        socket,
+        state.session_config.clone(),
+        state.state_manager.clone(),
+        state.mqtt_tx.clone(),
+        cancel,
+    )
+    .await;
 
-/// Forwards messages from the mpsc channel to the WebSocket sink.
-async fn forward_to_websocket(
-    mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut rx: mpsc::Receiver<Message>,
-) {
-    while let Some(msg) = rx.recv().await {
-        if ws_sender.send(msg).await.is_err() {
-            break;
-        }
+    // ---- deregister, but only if we are still the current connection ----
+    let still_current = deregister_connection(&state, &charge_point_id, generation).await;
+
+    if still_current {
+        let (upstream, downstream) = {
+            let mut mgr = state.state_manager.lock().await;
+            mgr.transition(ConnectionId::Downstream, ConnectionState::Disconnected);
+            (mgr.upstream_state(), mgr.downstream_state())
+        };
+        session::publish_status(&state.mqtt_tx, &charge_point_id, upstream, downstream);
+        info!(
+            component = "downstream",
+            charge_point_id = %charge_point_id,
+            "Charger disconnected"
+        );
+    } else {
+        debug!(
+            component = "downstream",
+            charge_point_id = %charge_point_id,
+            generation = generation,
+            "Displaced connection finished; leaving registry to its successor"
+        );
     }
-}
-
-/// Reads messages from the charger WebSocket and forwards them to the message channel.
-async fn run_read_loop(
-    mut ws_receiver: futures_util::stream::SplitStream<WebSocket>,
-    charge_point_id: String,
-    state: DownstreamState,
-    _tx: mpsc::Sender<Message>,
-) {
-    while let Some(result) = ws_receiver.next().await {
-        match result {
-            Ok(msg) => match &msg {
-                Message::Close(_) => {
-                    info!(
-                        component = "downstream",
-                        charge_point_id = %charge_point_id,
-                        "Charger sent close frame"
-                    );
-                    break;
-                }
-                Message::Text(_) | Message::Binary(_) => {
-                    if state
-                        .message_tx
-                        .send((charge_point_id.clone(), msg))
-                        .await
-                        .is_err()
-                    {
-                        error!(
-                            component = "downstream",
-                            charge_point_id = %charge_point_id,
-                            "Failed to forward message to forwarder channel"
-                        );
-                        break;
-                    }
-                }
-                Message::Ping(_) | Message::Pong(_) => {
-                    // Ping/Pong handled automatically by axum
-                }
-            },
-            Err(e) => {
-                error!(
-                    component = "downstream",
-                    charge_point_id = %charge_point_id,
-                    error = %e,
-                    "WebSocket read error"
-                );
-                break;
-            }
-        }
-    }
-
-    // Connection ended — clean up
-    {
-        let mut connections = state.connections.lock().await;
-        connections.remove(&charge_point_id);
-    }
-
-    // Emit Disconnected state
-    {
-        let mut mgr = state.state_manager.lock().await;
-        mgr.transition(ConnectionId::Downstream, ConnectionState::Disconnected);
-    }
-
-    info!(
-        component = "downstream",
-        charge_point_id = %charge_point_id,
-        "Charger disconnected"
-    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // --- Subprotocol validation tests ---
 
@@ -454,62 +357,126 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // --- DownstreamState construction test ---
+    // --- Registry behaviour ---
 
-    #[tokio::test]
-    async fn test_downstream_state_construction() {
-        let (msg_tx, _msg_rx) = mpsc::channel(32);
-        let state = DownstreamState {
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            state_manager: Arc::new(Mutex::new(ConnectionStateManager::new(16))),
-            message_tx: msg_tx,
-        };
-
-        let connections = state.connections.lock().await;
-        assert!(connections.is_empty());
-    }
-
-    // --- Connection replacement logic test ---
-
-    #[tokio::test]
-    async fn test_active_connection_replacement_sends_close() {
-        let (tx, mut rx) = mpsc::channel::<Message>(16);
-        let abort_handle = tokio::spawn(async {}).abort_handle();
-
-        let conn = ActiveConnection { tx, abort_handle };
-
-        // Send close frame via the active connection's channel
-        let _ = conn
-            .tx
-            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                code: 1000,
-                reason: "Replacing".into(),
-            })))
-            .await;
-
-        // Verify the close message was received
-        let msg = rx.recv().await.unwrap();
-        match msg {
-            Message::Close(Some(frame)) => {
-                assert_eq!(frame.code, 1000);
-                assert_eq!(frame.reason, "Replacing");
-            }
-            _ => panic!("Expected Close message"),
+    fn test_session_config() -> SessionConfig {
+        SessionConfig {
+            central_system_url: url::Url::parse("ws://127.0.0.1:1/ocpp").unwrap(),
+            upstream_bind_address: None,
+            subprotocol: OCPP16_SUBPROTOCOL.to_string(),
+            message_buffer_size: 100,
+            max_buffer_duration: Duration::from_secs(30),
+            connect_timeout: Duration::from_millis(50),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(50),
+            max_reconnect_window: Duration::from_millis(100),
+            call_tracker_max_age: Duration::from_secs(300),
         }
     }
 
-    // --- Router creation test ---
+    fn test_state() -> DownstreamState {
+        let (msg_tx, _msg_rx) = mpsc::channel(32);
+        // The receiver is dropped, which is fine: every MQTT send is
+        // best-effort by design and must never affect forwarding.
+        DownstreamState {
+            connections: Arc::new(Mutex::new(HashMap::new())),
+            state_manager: Arc::new(Mutex::new(ConnectionStateManager::new(16))),
+            session_config: Arc::new(test_session_config()),
+            mqtt_tx: msg_tx,
+            shutdown: CancellationToken::new(),
+            generation: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_downstream_state_construction() {
+        let state = test_state();
+        assert!(state.connections.lock().await.is_empty());
+    }
 
     #[tokio::test]
     async fn test_create_router_returns_router() {
-        let (msg_tx, _msg_rx) = mpsc::channel(32);
-        let state = DownstreamState {
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            state_manager: Arc::new(Mutex::new(ConnectionStateManager::new(16))),
-            message_tx: msg_tx,
-        };
+        let _router = create_router(test_state());
+    }
 
-        // Just verify it doesn't panic
-        let _router = create_router(state);
+    #[tokio::test]
+    async fn test_replacing_a_connection_cancels_the_old_one() {
+        let state = test_state();
+        let first = CancellationToken::new();
+        let second = CancellationToken::new();
+
+        let mut conns = state.connections.lock().await;
+        conns.insert(
+            "CP1".to_string(),
+            ActiveConnection {
+                generation: 1,
+                cancel: first.clone(),
+            },
+        );
+        let displaced = conns.insert(
+            "CP1".to_string(),
+            ActiveConnection {
+                generation: 2,
+                cancel: second.clone(),
+            },
+        );
+        drop(conns);
+
+        displaced
+            .expect("the first connection should be returned")
+            .cancel
+            .cancel();
+
+        assert!(first.is_cancelled(), "displaced session must be cancelled");
+        assert!(!second.is_cancelled(), "replacement must stay live");
+    }
+
+    /// The regression this generation guard exists for.
+    ///
+    /// A displaced connection's task finishes *after* its replacement has
+    /// registered. Without the guard it removes the map entry belonging to the
+    /// live connection, deregistering a charger that is still connected.
+    #[tokio::test]
+    async fn test_displaced_connection_does_not_deregister_its_replacement() {
+        let state = test_state();
+
+        {
+            let mut conns = state.connections.lock().await;
+            conns.insert(
+                "CP1".to_string(),
+                ActiveConnection {
+                    generation: 1,
+                    cancel: CancellationToken::new(),
+                },
+            );
+            // The replacement arrives and takes over the entry.
+            conns.insert(
+                "CP1".to_string(),
+                ActiveConnection {
+                    generation: 2,
+                    cancel: CancellationToken::new(),
+                },
+            );
+        }
+
+        // Now generation 1 unwinds and attempts its cleanup.
+        let displaced_generation = 1u64;
+        {
+            let mut conns = state.connections.lock().await;
+            let is_mine = conns
+                .get("CP1")
+                .map(|c| c.generation == displaced_generation)
+                .unwrap_or(false);
+            if is_mine {
+                conns.remove("CP1");
+            }
+        }
+
+        let conns = state.connections.lock().await;
+        let active = conns.get("CP1").expect("live connection must survive");
+        assert_eq!(
+            active.generation, 2,
+            "the replacement must remain registered after the displaced session unwinds"
+        );
     }
 }

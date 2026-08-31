@@ -22,12 +22,8 @@ use ocpp_proxy::state::HealthStatus;
 const VALID_STATUSES: [&str; 3] = ["healthy", "degraded", "unhealthy"];
 
 /// Valid string representations of ConnectionState when serialized.
-const VALID_CONNECTION_STATES: [&str; 4] = [
-    "disconnected",
-    "connecting",
-    "connected",
-    "reconnecting",
-];
+const VALID_CONNECTION_STATES: [&str; 4] =
+    ["disconnected", "connecting", "connected", "reconnecting"];
 
 /// Proptest strategy to generate a random HealthStatus.
 fn arb_health_status() -> impl Strategy<Value = HealthStatus> {
@@ -50,14 +46,18 @@ fn arb_connection_state() -> impl Strategy<Value = ConnectionState> {
 
 /// Proptest strategy to generate random MessageCounters.
 fn arb_message_counters() -> impl Strategy<Value = MessageCounters> {
-    (0u64..1_000_000, 0u64..1_000_000, 0u64..1_000_000, 0u64..1_000_000).prop_map(
-        |(ctc_fwd, ctc_drop, ctch_fwd, ctch_drop)| MessageCounters {
+    (
+        0u64..1_000_000,
+        0u64..1_000_000,
+        0u64..1_000_000,
+        0u64..1_000_000,
+    )
+        .prop_map(|(ctc_fwd, ctc_drop, ctch_fwd, ctch_drop)| MessageCounters {
             charger_to_central_forwarded: ctc_fwd,
             charger_to_central_dropped: ctc_drop,
             central_to_charger_forwarded: ctch_fwd,
             central_to_charger_dropped: ctch_drop,
-        },
-    )
+        })
 }
 
 /// Proptest strategy to generate a random HealthResponse.
@@ -72,6 +72,7 @@ fn arb_health_response() -> impl Strategy<Value = HealthResponse> {
     )
         .prop_map(
             |(status, upstream, downstream, mqtt, uptime_seconds, messages)| HealthResponse {
+                listening: true,
                 status,
                 upstream,
                 downstream,
@@ -186,6 +187,7 @@ proptest! {
             .expect("HealthResponse should serialize to JSON");
 
         let expected_status = match response.status {
+            HealthStatus::Idle => "idle",
             HealthStatus::Healthy => "healthy",
             HealthStatus::Degraded => "degraded",
             HealthStatus::Unhealthy => "unhealthy",
