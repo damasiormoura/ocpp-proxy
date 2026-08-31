@@ -18,7 +18,6 @@ set -uo pipefail
 IFACE="wwan0"
 LXC_NET="10.80.0.0/30"
 MOBIE_NET="10.200.10.0/24"
-TABLE="100"
 LOG_TAG="ocpp-wwan"
 
 # Filled in from /etc/default/ocpp-wwan so this script carries no site values.
@@ -49,19 +48,13 @@ if [ "$(cat "/sys/class/net/$IFACE/operstate" 2>/dev/null)" != "up" ]; then
     sleep 3
 fi
 
-# 3. Default route in the WWAN table.
-if ! ip route show table "$TABLE" 2>/dev/null | grep -q '^default'; then
-    log "rota default na tabela $TABLE estava AUSENTE - reaplicando via $WWAN_GW"
-    ip route replace default via "$WWAN_GW" dev "$IFACE" table "$TABLE" && repaired=1
-fi
-
-# 4. Destination route for the Mobi.e range out of the dongle.
+# 3. Destination route for the Mobi.e range out of the dongle.
 if ! ip route show | grep -q "^$MOBIE_NET"; then
     log "rota para $MOBIE_NET estava AUSENTE - reaplicando via $WWAN_GW"
     ip route replace "$MOBIE_NET" via "$WWAN_GW" dev "$IFACE" && repaired=1
 fi
 
-# 5. NAT and MSS clamp.
+# 4. NAT and MSS clamp.
 if ! iptables -t nat -C POSTROUTING -s "$LXC_NET" -o "$IFACE" -j MASQUERADE 2>/dev/null; then
     log "regra de MASQUERADE estava AUSENTE - reaplicando"
     iptables -t nat -A POSTROUTING -s "$LXC_NET" -o "$IFACE" -j MASQUERADE && repaired=1
@@ -71,7 +64,7 @@ if ! iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j
     iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu && repaired=1
 fi
 
-# 6. End-to-end reachability through the APN.
+# 5. End-to-end reachability through the APN.
 #
 #    TCP rather than ICMP. ICMP to Mobi.e does work (~79 ms, measured), so a
 #    ping probe would function — but an open TCP port proves the Central

@@ -191,6 +191,14 @@ line rather than by DHCP.
 
 ## Step 3 — Host: the watchdog
 
+> **Steps 1–3 were installed and verified on the host 2026-08-31.** `wwan0` is
+> pinned and holds its name (`10-wwan.link` confirmed applied by
+> `udevadm test-builtin net_setup_link`), the LAN default route remains the
+> only default route, `10.200.10.0/24` egresses `wwan0`, NAT and MSS clamp are
+> in place, and TCP to `10.200.10.200:80` succeeds from the host. The watchdog
+> timer is enabled, silent when healthy, and was tested by deleting the Mobi.e
+> route and the NAT rule — it logged both and restored them.
+
 ```bash
 scp host/wwan-watchdog.sh            proxmox:/usr/local/sbin/
 scp host/ocpp-wwan-watchdog.service  proxmox:/etc/systemd/system/
@@ -201,7 +209,8 @@ ssh proxmox 'systemctl daemon-reload && systemctl enable --now ocpp-wwan-watchdo
 ```
 
 It checks the link, the Mobi.e route, the NAT rule and the MSS clamp every
-5 minutes, repairs what is missing, and logs to syslog under
+5 minutes, is silent when healthy (verified — a healthy run emits zero log
+lines, so anything in the log is a real repair), repairs what is missing, and logs to syslog under
 tag `ocpp-wwan` — which LXC 101 collects. Same check-repair-log pattern as
 `iot-isolation-enforce.sh`, and for the same reason: state you set up once does
 not stay set up.
