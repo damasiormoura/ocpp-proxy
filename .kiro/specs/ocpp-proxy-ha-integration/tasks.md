@@ -329,7 +329,8 @@ APN uplink. Tasks 15–17 depend on the fixes in 10.3, 10.4, 11.1 and 13.1.
   - [ ] 19.6 Give the charger a DHCP reservation and apply the Proxmox firewall rules on LXC 113
   - [x] 19.7 **Record the charger's original Mobi.e URL** — `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058`. Still to capture: the rest of the charger's OCPP settings, for the Requirement 11.13 bypass
   - [x] 19.8 DNS question resolved — the endpoint is a literal IP, so no resolver configuration is needed on the APN path
-  - [ ] 19.9 Verify the endpoint over the APN: TCP to `10.200.10.200:80`, then a WebSocket upgrade expecting `101` with `Sec-WebSocket-Protocol: ocpp1.6`. Do not run against a live charger session on the same Charge Point ID
+  - [x] 19.9 Verify the endpoint over the APN — **done 2026-08-31 from the Proxmox host.** TCP open, ICMP 79 ms, `GET /` 200, WebSocket upgrade returned `101` from `nginx/1.6.2` with `ocpp1.6` negotiated
+  - [ ] 19.11 Confirm Mobi.e actually accepts `MOBI-ALM-00058` — the 101 does not establish this. Controls returned 101 for an invalid Charge Point ID and for a request with no subprotocol, so the front end upgrades any path. Requires sending a real `BootNotification` and reading the response status, which writes to the operator's system
   - [ ] 19.10 Get the charger onto the IoT network — it currently has no DHCP lease and no ARP entry on either segment
 
 - [ ] 14. Final checkpoint - Ensure all tests pass

@@ -54,6 +54,8 @@ Verified 2026-08-31 while the modem reported a healthy connected LTE session:
 | Dongle gateway `192.168.0.1` | reachable, 0.8 ms |
 | ICMP to `1.1.1.1` | 100% loss |
 | TCP to `http://example.com` | no connection |
+| ICMP to `10.200.10.200` | **works, 79 ms** — inside the garden ICMP is fine |
+| TCP to `10.200.10.200:80` | **open** |
 | DNS to `192.168.0.1:53` | timeout — the dongle does not proxy DNS |
 | DNS to `8.8.8.8` | timeout |
 | DNS server in the DHCP lease | none offered |
@@ -65,9 +67,10 @@ that shape the deployment:
    private address, `10.200.10.200`, so there is nothing to resolve. Had it
    been a hostname, the absence of DNS on this path would have been a problem.
 2. **Never health-check the WWAN path against a public host.** No public host
-   is reachable, and ICMP is dropped even when the path works. The watchdog
-   makes a TCP connection to `10.200.10.200:80` instead — set `PROBE_HOST` and
-   `PROBE_PORT` in `/etc/default/ocpp-wwan`.
+   is reachable. ICMP *does* work to Mobi.e itself, but the watchdog makes a
+   TCP connection to `10.200.10.200:80` because an open port proves the Central
+   System is listening where a ping only proves the host answers. Set
+   `PROBE_HOST` and `PROBE_PORT` in `/etc/default/ocpp-wwan`.
 3. **Nothing is encrypted between the proxy and Mobi.e.** The endpoint is
    plaintext `ws://` on port 80; the private APN is the entire security
    boundary. That is the charger's own pre-existing arrangement, not something
@@ -156,8 +159,26 @@ ssh proxmox 'curl -i --http1.1 -m 10 \
   http://10.200.10.200/ocpp/1.6/MOBI-ALM-00058'
 ```
 
-A 400/403/404 still proves the path works — Mobi.e is merely refusing that
-handshake. Only a timeout means the path is broken.
+**Verified 2026-08-31 from the Proxmox host** — the full path works:
+
+```
+HTTP/1.1 101 Switching Protocols
+Server: nginx/1.6.2
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+Sec-WebSocket-Protocol: ocpp1.6
+```
+
+A `curl: (28) Operation timed out` printed alongside the 101 is expected, not a
+failure: curl completes the upgrade then waits for data, and an OCPP Central
+System waits for the charge point to speak first.
+
+> **A 101 proves reachability, not identity.** Two controls were run against
+> the same endpoint: omitting the subprotocol still returned 101, and a
+> deliberately invalid Charge Point ID (`MOBI-DOES-NOT-EXIST`) *also* returned
+> 101 with `ocpp1.6` negotiated. The nginx front end upgrades any path.
+> Confirming that Mobi.e accepts `MOBI-ALM-00058` requires an actual OCPP
+> `BootNotification` and reading the response status — which writes to the
+> operator's system and should be done deliberately, not as a routine check.
 
 > Do not run this while the charger is live on the same Charge Point ID.
 > Mobi.e may close the charger's session in favour of the new connection, the

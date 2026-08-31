@@ -73,9 +73,11 @@ fi
 
 # 6. End-to-end reachability through the APN.
 #
-#    TCP, not ICMP: this APN drops ping even when it is working, so a ping
-#    probe would report a permanent false failure. There is also no public
-#    host to probe — the APN is closed — so the target is Mobi.e itself.
+#    TCP rather than ICMP. ICMP to Mobi.e does work (~79 ms, measured), so a
+#    ping probe would function — but an open TCP port proves the Central
+#    System is actually listening, where a ping only proves the host answers.
+#    The target is Mobi.e itself because the APN is closed: there is no public
+#    host to probe against.
 if [ -n "$PROBE_HOST" ] && [ -n "$PROBE_PORT" ]; then
     if ! timeout 8 bash -c "</dev/tcp/$PROBE_HOST/$PROBE_PORT" 2>/dev/null; then
         log "AVISO: $PROBE_HOST:$PROBE_PORT inalcancavel via $IFACE"
