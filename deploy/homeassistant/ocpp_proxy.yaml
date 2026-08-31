@@ -1,0 +1,240 @@
+# Home Assistant package for the OCPP proxy.
+#
+# Install to  /config/packages/ocpp_proxy.yaml  and make sure configuration.yaml
+# has:
+#
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# then restart Home Assistant. See README.md in this directory.
+#
+# ---------------------------------------------------------------------------
+# Message shapes these templates rely on, from live traffic:
+#
+#   Call        payload = [2, "<uniqueId>", "<Action>", {args}]   -> args at [3]
+#   CallResult  payload = [3, "<uniqueId>", {args}]               -> args at [2]
+#
+# So charger/* topics read payload[3] and central_system/* read payload[2].
+# Getting that backwards is the easiest mistake here and yields silent
+# "unknown" sensors.
+#
+# MeterValues does NOT always carry transactionId — observed both with and
+# without on the same charger — so nothing may depend on it being present.
+# ---------------------------------------------------------------------------
+
+mqtt:
+  # =========================================================================
+  # Live electrical measurements, from MeterValues
+  # =========================================================================
+  sensor:
+    - name: "Charger Power"
+      unique_id: ocpp_charger_power
+      state_topic: "ocpp/MOBI-ALM-00058/charger/MeterValues"
+      device_class: power
+      state_class: measurement
+      unit_of_measurement: "W"
+      # `| first` raises on an empty sequence, so the list is materialised and
+      # length-checked instead. This charger sends reduced MeterValues with
+      # only some measurands present; the naive form errors the template and
+      # the sensor goes unavailable.
+      value_template: >-
+        {% set sv = value_json.payload[3].meterValue | default([], true) | last %}
+        {% set vals = (sv.sampledValue | default([], true))
+             | selectattr('measurand', 'defined')
+             | selectattr('measurand', 'eq', 'Power.Active.Import')
+             | map(attribute='value') | list %}
+        {{ (vals[0] | float(0)) | round(0) | int if vals else 0 }}
+      availability: &proxy_availability
+        - topic: "ocpp/MOBI-ALM-00058/availability"
+          payload_available: "online"
+          payload_not_available: "offline"
+      device: &charger_device
+        identifiers: ["ocpp_proxy_MOBI-ALM-00058"]
+        name: "EV Charger (MOBI-ALM-00058)"
+        manufacturer: "Autel"
+        model: "MaxiCharger via OCPP proxy"
+
+    # Lifetime meter register. state_class total_increasing makes this usable
+    # by the Home Assistant Energy dashboard directly.
+    - name: "Charger Energy Meter"
+      unique_id: ocpp_charger_energy_meter
+      state_topic: "ocpp/MOBI-ALM-00058/charger/MeterValues"
+      device_class: energy
+      state_class: total_increasing
+      unit_of_measurement: "kWh"
+      value_template: >-
+        {% set sv = value_json.payload[3].meterValue | default([], true) | last %}
+        {% set vals = (sv.sampledValue | default([], true))
+             | selectattr('measurand', 'defined')
+             | selectattr('measurand', 'eq', 'Energy.Active.Import.Register')
+             | map(attribute='value') | list %}
+        {{ ((vals[0] | float(0)) / 1000) | round(3) if vals else this.state }}
+      availability: *proxy_availability
+      device: *charger_device
+
+    - name: "Charger Current L1"
+      unique_id: ocpp_charger_current_l1
+      state_topic: "ocpp/MOBI-ALM-00058/charger/MeterValues"
+      device_class: current
+      state_class: measurement
+      unit_of_measurement: "A"
+      value_template: >-
+        {% set sv = value_json.payload[3].meterValue | default([], true) | last %}
+        {% set vals = (sv.sampledValue | default([], true))
+             | selectattr('measurand', 'defined')
+             | selectattr('measurand', 'eq', 'Current.Import')
+             | selectattr('phase', 'defined')
+             | selectattr('phase', 'eq', 'L1')
+             | map(attribute='value') | list %}
+        {{ (vals[0] | float(0)) | round(2) if vals else 0 }}
+      availability: *proxy_availability
+      device: *charger_device
+
+    - name: "Charger Voltage L1"
+      unique_id: ocpp_charger_voltage_l1
+      state_topic: "ocpp/MOBI-ALM-00058/charger/MeterValues"
+      device_class: voltage
+      state_class: measurement
+      unit_of_measurement: "V"
+      value_template: >-
+        {% set sv = value_json.payload[3].meterValue | default([], true) | last %}
+        {% set vals = (sv.sampledValue | default([], true))
+             | selectattr('measurand', 'defined')
+             | selectattr('measurand', 'eq', 'Voltage')
+             | selectattr('phase', 'defined')
+             | selectattr('phase', 'eq', 'L1')
+             | map(attribute='value') | list %}
+        {{ (vals[0] | float(0)) | round(1) if vals else 0 }}
+      availability: *proxy_availability
+      device: *charger_device
+
+    # =======================================================================
+    # Charge point state, from StatusNotification
+    # =======================================================================
+    - name: "Charger Status"
+      unique_id: ocpp_charger_status
+      state_topic: "ocpp/MOBI-ALM-00058/charger/StatusNotification"
+      icon: mdi:ev-station
+      # Available / Preparing / Charging / SuspendedEV / SuspendedEVSE /
+      # Finishing / Reserved / Unavailable / Faulted
+      value_template: "{{ value_json.payload[3].status | default('Unknown', true) }}"
+      json_attributes_topic: "ocpp/MOBI-ALM-00058/charger/StatusNotification"
+      json_attributes_template: "{{ value_json.payload[3] | tojson }}"
+      availability: *proxy_availability
+      device: *charger_device
+
+    - name: "Charger Error Code"
+      unique_id: ocpp_charger_error_code
+      state_topic: "ocpp/MOBI-ALM-00058/charger/StatusNotification"
+      icon: mdi:alert-circle-outline
+      value_template: "{{ value_json.payload[3].errorCode | default('NoError', true) }}"
+      availability: *proxy_availability
+      device: *charger_device
+
+    # =======================================================================
+    # Transaction, from StartTransaction / StopTransaction
+    # =======================================================================
+    # The Central System assigns the transaction id, so it comes from the
+    # CallResult — payload[2], not payload[3].
+    - name: "Charger Transaction ID"
+      unique_id: ocpp_charger_transaction_id
+      state_topic: "ocpp/MOBI-ALM-00058/central_system/StartTransaction"
+      icon: mdi:identifier
+      value_template: "{{ value_json.payload[2].transactionId | default('none', true) }}"
+      availability: *proxy_availability
+      device: *charger_device
+
+    - name: "Charger Authorization"
+      unique_id: ocpp_charger_authorization
+      state_topic: "ocpp/MOBI-ALM-00058/central_system/Authorize"
+      icon: mdi:card-account-details-outline
+      value_template: "{{ value_json.payload[2].idTagInfo.status | default('Unknown', true) }}"
+      availability: *proxy_availability
+      device: *charger_device
+
+    # Meter reading at the moment the transaction opened. Used to derive the
+    # energy delivered in the current session.
+    - name: "Charger Session Meter Start"
+      unique_id: ocpp_charger_session_meter_start
+      state_topic: "ocpp/MOBI-ALM-00058/charger/StartTransaction"
+      device_class: energy
+      state_class: total
+      unit_of_measurement: "kWh"
+      value_template: >-
+        {{ (value_json.payload[3].meterStart | float(0) / 1000) | round(3) }}
+      availability: *proxy_availability
+      device: *charger_device
+
+    - name: "Charger Last Session Energy"
+      unique_id: ocpp_charger_last_session_energy
+      state_topic: "ocpp/MOBI-ALM-00058/charger/StopTransaction"
+      device_class: energy
+      state_class: total
+      unit_of_measurement: "kWh"
+      value_template: >-
+        {{ (value_json.payload[3].meterStop | float(0) / 1000) | round(3) }}
+      json_attributes_topic: "ocpp/MOBI-ALM-00058/charger/StopTransaction"
+      json_attributes_template: "{{ value_json.payload[3] | tojson }}"
+      availability: *proxy_availability
+      device: *charger_device
+
+    # =======================================================================
+    # Proxy and link health
+    # =======================================================================
+    # This topic is retained, so these survive a Home Assistant restart.
+    - name: "OCPP Proxy Upstream"
+      unique_id: ocpp_proxy_upstream
+      state_topic: "ocpp/MOBI-ALM-00058/status"
+      icon: mdi:cloud-outline
+      value_template: "{{ value_json.upstream | default('unknown', true) }}"
+      device: *charger_device
+
+    - name: "OCPP Proxy Downstream"
+      unique_id: ocpp_proxy_downstream
+      state_topic: "ocpp/MOBI-ALM-00058/status"
+      icon: mdi:ev-plug-type2
+      value_template: "{{ value_json.downstream | default('unknown', true) }}"
+      device: *charger_device
+
+  binary_sensor:
+    # Driven by the proxy's MQTT Last Will. This is the ONLY thing that tells
+    # you the proxy has died — nothing else watches that process, and with the
+    # APN SIM in the dongle the proxy is the charger's only path to Mobi.e.
+    # Alert on this.
+    - name: "OCPP Proxy Online"
+      unique_id: ocpp_proxy_online
+      state_topic: "ocpp/MOBI-ALM-00058/availability"
+      payload_on: "online"
+      payload_off: "offline"
+      device_class: connectivity
+      device: *charger_device
+
+# =========================================================================
+# Derived values
+# =========================================================================
+template:
+  - sensor:
+      # Energy delivered in the session currently in progress.
+      #
+      # Caveat worth knowing: meter_start only arrives on a StartTransaction
+      # message, which is not retained. After a Home Assistant restart mid-
+      # session this reads "unknown" until the next transaction begins. The
+      # lifetime register and the Energy dashboard are unaffected.
+      - name: "Charger Session Energy"
+        unique_id: ocpp_charger_session_energy
+        device_class: energy
+        state_class: total_increasing
+        unit_of_measurement: "kWh"
+        availability: >-
+          {{ states('sensor.charger_energy_meter') not in ['unknown', 'unavailable', 'none']
+             and states('sensor.charger_session_meter_start') not in ['unknown', 'unavailable', 'none'] }}
+        state: >-
+          {% set now_kwh = states('sensor.charger_energy_meter') | float(0) %}
+          {% set start_kwh = states('sensor.charger_session_meter_start') | float(0) %}
+          {{ [now_kwh - start_kwh, 0] | max | round(3) }}
+
+      - name: "Charger Charging"
+        unique_id: ocpp_charger_is_charging
+        icon: mdi:flash
+        state: >-
+          {{ 'on' if states('sensor.charger_status') == 'Charging' else 'off' }}

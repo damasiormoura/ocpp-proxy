@@ -1,0 +1,158 @@
+# Lovelace dashboard for the OCPP proxy.
+#
+# Settings -> Dashboards -> (your dashboard) -> pencil -> three dots ->
+# "Raw configuration editor", then paste the `views:` entry below.
+#
+# The history-graph and statistics-graph cards are built in. The gauge maxima
+# assume a ~7.4 kW single-phase charger (32 A); adjust if yours differs — this
+# one was observed drawing 3.65 kW at 16 A on L1.
+
+views:
+  - title: EV Charger
+    path: ev-charger
+    icon: mdi:ev-station
+    cards:
+      # ---------------------------------------------------------------
+      # Is anything wrong? Answer that before showing any numbers.
+      # ---------------------------------------------------------------
+      - type: conditional
+        conditions:
+          - entity: binary_sensor.ocpp_proxy_online
+            state: "off"
+        card:
+          type: markdown
+          content: >
+            ## ⚠️ OCPP proxy is OFFLINE
+
+            The charger has **no path to Mobi.e**. Charging and billing are
+            stopped until the proxy returns — the APN SIM lives in the dongle
+            on the Proxmox host, so there is no fallback route.
+
+            Check `LXC 113` on the Proxmox host:
+            `systemctl status ocpp-proxy`
+
+      - type: conditional
+        conditions:
+          - entity: sensor.charger_error_code
+            state_not: "NoError"
+        card:
+          type: markdown
+          content: >
+            ## ⚠️ Charger reports {{ states('sensor.charger_error_code') }}
+
+            Status: {{ states('sensor.charger_status') }}
+
+      # ---------------------------------------------------------------
+      # At a glance
+      # ---------------------------------------------------------------
+      - type: glance
+        title: Status
+        columns: 4
+        entities:
+          - entity: sensor.charger_status
+            name: Charger
+          - entity: binary_sensor.ocpp_proxy_online
+            name: Proxy
+          - entity: sensor.ocpp_proxy_upstream
+            name: Mobi.e
+          - entity: sensor.charger_transaction_id
+            name: Transaction
+
+      # ---------------------------------------------------------------
+      # Live power and the session in progress
+      # ---------------------------------------------------------------
+      - type: horizontal-stack
+        cards:
+          - type: gauge
+            entity: sensor.charger_power
+            name: Power
+            unit: W
+            min: 0
+            max: 7400
+            severity:
+              green: 0
+              yellow: 7000
+              red: 7300
+          - type: gauge
+            entity: sensor.charger_current_l1
+            name: Current L1
+            unit: A
+            min: 0
+            max: 32
+            severity:
+              green: 0
+              yellow: 30
+              red: 31
+
+      - type: entities
+        title: This session
+        state_color: true
+        entities:
+          - entity: sensor.charger_session_energy
+            name: Energy delivered
+            icon: mdi:lightning-bolt
+          - entity: sensor.charger_session_meter_start
+            name: Meter at start
+          - entity: sensor.charger_energy_meter
+            name: Meter now
+          - entity: sensor.charger_transaction_id
+            name: Transaction ID
+          - entity: sensor.charger_authorization
+            name: Last authorisation
+          - type: divider
+          - entity: sensor.charger_last_session_energy
+            name: Previous session meter stop
+
+      # ---------------------------------------------------------------
+      # Trends
+      # ---------------------------------------------------------------
+      - type: history-graph
+        title: Power (last 6 hours)
+        hours_to_show: 6
+        entities:
+          - entity: sensor.charger_power
+            name: Power
+
+      - type: history-graph
+        title: Charger state
+        hours_to_show: 24
+        entities:
+          - entity: sensor.charger_status
+            name: Status
+          - entity: binary_sensor.ocpp_proxy_online
+            name: Proxy online
+
+      - type: statistics-graph
+        title: Energy per day
+        chart_type: bar
+        period: day
+        days_to_show: 30
+        stat_types:
+          - change
+        entities:
+          - sensor.charger_energy_meter
+
+      # ---------------------------------------------------------------
+      # Electrical detail — collapsed by default, rarely needed
+      # ---------------------------------------------------------------
+      - type: entities
+        title: Electrical
+        entities:
+          - entity: sensor.charger_voltage_l1
+            name: Voltage L1
+          - entity: sensor.charger_current_l1
+            name: Current L1
+          - entity: sensor.charger_power
+            name: Active power
+
+      - type: entities
+        title: Proxy link
+        entities:
+          - entity: binary_sensor.ocpp_proxy_online
+            name: Proxy process
+          - entity: sensor.ocpp_proxy_upstream
+            name: Upstream to Mobi.e
+          - entity: sensor.ocpp_proxy_downstream
+            name: Downstream to charger
+          - entity: sensor.charger_error_code
+            name: Charger error code
