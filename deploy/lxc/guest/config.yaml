@@ -38,7 +38,20 @@ charge_point_id: "MOBI-ALM-00058"
 # static route 192.168.52.0/24 via 192.168.51.10 — the same path Home Assistant
 # and Frigate already use. The isolation DROP rule does not match this
 # destination, so it needs no exception.
-listen_address: "192.168.52.30"
+# 0.0.0.0, deliberately, because the charger's network moved.
+#
+# The powerline AP's uplink is on the main router rather than the spare BD4, so
+# the charger lands on 192.168.50.x — and it is a general home AP, carrying
+# phones as well as the charger, which is why putting it behind the IoT
+# isolation would be wrong. Binding all legs means the charger is served
+# whichever network it is on, and moving the powerline to the IoT side later
+# needs no change here.
+#
+# The listener is reachable on 192.168.50.28 (main LAN), 192.168.52.30 (IoT
+# path) and 10.80.0.2 (a point-to-point /30 to the host only). Restricting it
+# is the Proxmox firewall's job — see the deployment runbook, and note that the
+# datacenter firewall is currently disabled.
+listen_address: "0.0.0.0"
 listen_port: 9000
 
 health_port: 8080
