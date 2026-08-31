@@ -43,38 +43,70 @@ config files:
 |---|---|
 | Dongle subnet and gateway | **Resolved 2026-08-31.** `192.168.0.0/24`, gateway `192.168.0.1`, DHCP offers `.169`. Modem reports LTE, full signal, `ppp_connected`, operator NOS. Confirm the DHCP pool range in the dongle UI and move the static address outside it if `.169` falls inside. |
 | Mobi.e endpoint | **Resolved.** `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058`, read from the charger's own OCPP configuration. Charge Point ID `MOBI-ALM-00058`; the proxy is configured with the base `ws://10.200.10.200/ocpp/1.6` and appends the ID. |
-| Charger address | **Still blocking.** MAC `18:d7:93:60:b6:19` is absent from both networks at every layer — see below. |
+| Charger address | **Found: `192.168.51.59`** — see below. |
 
-### Charger: what is known, 2026-08-31
+### Charger: identified 2026-08-31
 
-The charger is **not reachable on either network**, established at layer 2, not
-inferred from a failed ping:
+`192.168.51.59` is the Autel charger, confirmed by the TLS certificate on its
+outbound cloud session:
 
-| Check | Result |
-|---|---|
-| DHCP lease, either router | none |
-| ARP sweep, all 254 hosts on `192.168.51.0/24` | 27 responders, all known IoT devices |
-| ARP sweep, all 254 hosts on `192.168.50.0/24` | MAC not present |
-| IoT bridge MAC table | 37 entries, all accounted for; no `18:d7:93` |
-| Main bridge MAC table | no `18:d7:93` |
-| 60 s packet capture on the IoT segment | nothing from that MAC (capture proven working by control) |
+```
+subject = C=CN, ST=Guangdong Sheng,
+          O=Autel Intelligent Technology Corp.,Ltd., CN=*.autel.com
+```
 
-Its only trace anywhere is an **incomplete** ARP entry for `192.168.50.59` on
-the main router — the record of a failed lookup, not a live host. With no DHCP
-lease on either router, that points to the charger being statically configured
-at `192.168.50.59` from its original setup.
+**The charger has two MAC addresses, and the confusion is worth recording.**
 
-The powerline path itself is fine: the TL-WPA4220 holds `192.168.51.209` and
-was observed ARPing on the segment. So the bridge works and the charger is not
-reaching it — most likely an Ethernet link that is not actually up, a disabled
-LAN interface on the charger, or the charger's comms module being off.
+| Interface | MAC | State |
+|---|---|---|
+| ESP32 WiFi / comms module | `0c:dc:7e:57:7f:0c` (Espressif, hostname `espressif`) | **active**, holds `192.168.51.59` |
+| Ethernet | `18:d7:93:60:b6:19` | **down** — absent from both networks at every layer |
 
-**When it does come up it will need reconfiguring, not just plugging in.** A
-static `192.168.50.59` cannot work on the `192.168.51.0/24` segment. It needs
-either DHCP from the spare BD4 (simplest — it supplies the gateway
-automatically) or a static address in `192.168.51.0/24` **with gateway
-`192.168.51.1`**. The gateway matters: the proxy is on a different subnet
-(`192.168.52.30`), so without a default route the charger cannot reach it.
+Searching for the Ethernet MAC finds nothing anywhere, which is correct and not
+a fault: that port is simply unused. The charger is on the network via WiFi,
+associated to the TL-WPA4220's own SSID rather than to the spare BD4 — it does
+not appear in any of the spare router's `wlanconfig` station lists, and arrives
+from the powerline uplink port.
+
+It currently has **no flows to `10.200.10.200`**, as expected: its configured
+Central System is only reachable over the APN, and the SIM is now in the
+dongle. It maintains a TLS session to Autel's cloud instead.
+
+### The charger's link is the worst on the segment
+
+Measured from the host, 20 pings each:
+
+| Device | Path | avg RTT | jitter | max |
+|---|---|---|---|---|
+| **Charger `.59`** | WiFi → WPA4220 → powerline | **65.8 ms** | **±31.7** | 125 ms |
+| TL-WPA4220 `.209` | powerline, wired | 6.9 ms | ±1.3 | 9 ms |
+| Shelly `.57` | spare-router WiFi | 7.9 ms | ±2.8 | 14 ms |
+
+The powerline is not the problem — it is fast and stable. The charger's own
+WiFi hop is, roughly 9× slower and 12× more jittery than anything else, which
+is what an ESP32 module with WiFi power-saving on a second wireless hop looks
+like.
+
+**Recommendation: use the Ethernet port.** Plugging `18:d7:93:60:b6:19` into a
+TL-WPA4220 LAN port moves the charger onto the wired side of the powerline and
+should bring it to roughly the WPA4220's own 7 ms. That matters more than
+ordinary tuning here, because this link sits on the charger's only path to
+Mobi.e: every wireless hop removed from that path is a failure mode removed.
+
+Two wireless hops are on the OCPP path today — charger→WPA4220 and
+spare BD4→Proxmox host. Ethernet removes the first. The second is inherent to
+the as-built IoT design, which fell back to the host's WiFi because the USB
+Ethernet NIC the original plan called for was unavailable. For a
+charging-critical path that NIC is now worth more than it was when
+`iot-isolation.md` was written.
+
+### Still to do on the charger
+
+- **DHCP reservation on the spare BD4** for `0c:dc:7e:57:7f:0c` — `.59` is
+  currently an ordinary lease, and Requirement 12.4 needs it stable before it
+  can be named in firewall rules
+- **Capture its remaining OCPP settings** for the Requirement 11.13 bypass
+- **Repoint it** at `ws://192.168.52.30:9000/MOBI-ALM-00058` once the proxy runs
 
 The path is verified working ahead of the charger's arrival — from the IoT
 segment, `192.168.52.1` and HA at `192.168.52.144` both answer in 2–4 ms,

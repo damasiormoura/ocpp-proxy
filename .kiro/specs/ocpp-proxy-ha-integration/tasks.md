@@ -331,8 +331,10 @@ APN uplink. Tasks 15–17 depend on the fixes in 10.3, 10.4, 11.1 and 13.1.
   - [x] 19.8 DNS question resolved — the endpoint is a literal IP, so no resolver configuration is needed on the APN path
   - [x] 19.9 Verify the endpoint over the APN — **done 2026-08-31 from the Proxmox host.** TCP open, ICMP 79 ms, `GET /` 200, WebSocket upgrade returned `101` from `nginx/1.6.2` with `ocpp1.6` negotiated
   - [ ] 19.11 Confirm Mobi.e actually accepts `MOBI-ALM-00058` — the 101 does not establish this. Controls returned 101 for an invalid Charge Point ID and for a request with no subprotocol, so the front end upgrades any path. Requires sending a real `BootNotification` and reading the response status, which writes to the operator's system
-  - [ ] 19.10 Get the charger onto the IoT network. MAC `18:d7:93:60:b6:19` is absent from both networks at layer 2 — no lease, no ARP, not in either bridge's MAC table, and a 60 s capture on the IoT segment saw nothing from it. The powerline bridge itself works (TL-WPA4220 at `192.168.51.209`, observed ARPing), so the charger is not reaching it. Its only trace is an incomplete ARP entry for `192.168.50.59` on the main router, suggesting a static address from its original setup
-  - [ ] 19.12 Reconfigure the charger's addressing. A static `192.168.50.59` cannot work on `192.168.51.0/24`. Use DHCP from the spare BD4, or a static in `192.168.51.0/24` **with gateway `192.168.51.1`** — the proxy is on a different subnet, so a default route is required, not optional
+  - [x] 19.10 Charger located at `192.168.51.59`, confirmed by the Autel TLS certificate on its cloud session. Two MACs: `0c:dc:7e:57:7f:0c` (ESP32 WiFi, active) and `18:d7:93:60:b6:19` (Ethernet, down) — searching for the latter finds nothing because the port is unused
+  - [ ] 19.12 DHCP reservation on the spare BD4 for `0c:dc:7e:57:7f:0c`, so the address is stable enough to name in firewall rules
+  - [ ] 19.14 Move the charger to Ethernet. Its WiFi hop measures 65.8 ms avg / ±31.7 jitter / 125 ms max, against 6.9 ms / ±1.3 for the wired-behind-powerline TL-WPA4220. Plugging `18:d7:93:60:b6:19` into a WPA4220 LAN port removes a wireless hop from the charger's only path to Mobi.e
+  - [ ] 19.15 Repoint the charger at `ws://192.168.52.30:9000/MOBI-ALM-00058` once the proxy is running
   - [x] 19.13 Verify the charger-to-proxy path ahead of time — from the IoT segment, `192.168.52.1` answers in 2-4 ms via the spare router's static route and the host's forwarding
 
 - [ ] 14. Final checkpoint - Ensure all tests pass
