@@ -19,7 +19,7 @@ ocpp-proxy/
 ├── tests/
 │   └── property_*.rs    # Property-based tests (proptest) for correctness properties
 ├── deploy/
-│   └── ecs-task-definition.json  # AWS ECS task definition
+│   └── lxc/                      # Proxmox LXC runbook, host networking, systemd units
 ├── Cargo.toml
 ├── Cargo.lock
 ├── Dockerfile           # Multi-stage Docker build

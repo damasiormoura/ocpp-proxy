@@ -19,10 +19,7 @@ use tokio::sync::mpsc;
 /// Create a test OcppFrame with a given index for identification.
 fn make_test_frame(index: usize) -> OcppFrame {
     OcppFrame {
-        raw: format!(
-            r#"[2, "msg-{}", "Heartbeat", {{}}]"#,
-            index
-        ),
+        raw: format!(r#"[2, "msg-{}", "Heartbeat", {{}}]"#, index),
         message_type: OcppMessageType::Call {
             action: "Heartbeat".to_string(),
         },

@@ -46,11 +46,11 @@ fn arb_string_value() -> impl Strategy<Value = String> {
             Just(".".to_string()),
             Just("!".to_string()),
             // Unicode characters
-            Just("\u{00e9}".to_string()),  // é
-            Just("\u{00f1}".to_string()),  // ñ
-            Just("\u{4e16}".to_string()),  // 世
-            Just("\u{754c}".to_string()),  // 界
-            Just("\u{2603}".to_string()),  // ☃
+            Just("\u{00e9}".to_string()), // é
+            Just("\u{00f1}".to_string()), // ñ
+            Just("\u{4e16}".to_string()), // 世
+            Just("\u{754c}".to_string()), // 界
+            Just("\u{2603}".to_string()), // ☃
         ],
         0..15,
     )
@@ -90,10 +90,7 @@ fn arb_nested_json_object() -> impl Strategy<Value = Value> {
     prop::collection::vec(
         (
             prop::string::string_regex("[a-zA-Z][a-zA-Z0-9]{0,10}").unwrap(),
-            prop_oneof![
-                arb_json_value(),
-                arb_json_object(),
-            ],
+            prop_oneof![arb_json_value(), arb_json_object(),],
         ),
         0..5,
     )
@@ -215,13 +212,23 @@ fn arb_call_error_frame() -> impl Strategy<Value = String> {
             let details_str = serde_json::to_string(&details).unwrap();
             let details_formatted = inject_whitespace(&details_str, &ws1, &ws2);
             // Escape the description for safe JSON embedding
-            let desc_escaped = description
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"");
+            let desc_escaped = description.replace('\\', "\\\\").replace('"', "\\\"");
             format!(
                 "[{}4{},{}\"{}\"{},{}\"{}\"{},{}\"{}\"{},{}{}{}]",
-                ws1, ws2, ws1, uid, ws2, ws1, error_code, ws2, ws1, desc_escaped, ws2, ws1,
-                details_formatted, ws2
+                ws1,
+                ws2,
+                ws1,
+                uid,
+                ws2,
+                ws1,
+                error_code,
+                ws2,
+                ws1,
+                desc_escaped,
+                ws2,
+                ws1,
+                details_formatted,
+                ws2
             )
         })
 }

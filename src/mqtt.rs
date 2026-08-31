@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, EventLoop, Event, Incoming, MqttOptions, QoS, LastWill, Transport};
 use rumqttc::TlsConfiguration;
+use rumqttc::{AsyncClient, Event, EventLoop, Incoming, LastWill, MqttOptions, QoS, Transport};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -88,8 +88,12 @@ pub struct MqttPublisher {
     client: AsyncClient,
     /// The rumqttc event loop for processing connection events.
     eventloop: EventLoop,
-    /// Charge Point ID used for topic construction.
-    charge_point_id: String,
+    /// Charge Point ID used for the availability topic and Last Will.
+    ///
+    /// Message and status topics come from each event instead, because the
+    /// broker connection is opened before any charger has connected and the
+    /// Last Will has to be registered at that point.
+    lwt_charge_point_id: Option<String>,
     /// Receiver for forwarded OCPP events from the forwarder.
     event_rx: mpsc::Receiver<MqttEvent>,
     /// Buffer for messages when broker is unreachable.
@@ -115,16 +119,15 @@ impl MqttPublisher {
     /// Call `start()` to begin the connection and event loop.
     pub fn new(
         mqtt_config: &MqttConfig,
-        charge_point_id: String,
+        lwt_charge_point_id: Option<String>,
         event_rx: mpsc::Receiver<MqttEvent>,
         max_buffer_size: usize,
     ) -> Result<Self, ProxyError> {
-        let client_id = format!("ocpp-proxy-{}", charge_point_id);
-        let mut mqttoptions = MqttOptions::new(
-            &client_id,
-            &mqtt_config.host,
-            mqtt_config.port,
-        );
+        let client_id = match &lwt_charge_point_id {
+            Some(id) => format!("ocpp-proxy-{}", id),
+            None => "ocpp-proxy".to_string(),
+        };
+        let mut mqttoptions = MqttOptions::new(&client_id, &mqtt_config.host, mqtt_config.port);
 
         // Configure credentials
         mqttoptions.set_credentials(&mqtt_config.username, &mqtt_config.password);
@@ -132,19 +135,33 @@ impl MqttPublisher {
         // Configure keepalive (60 seconds)
         mqttoptions.set_keep_alive(Duration::from_secs(60));
 
-        // Configure Last Will and Testament
-        let availability_topic = format!("ocpp/{}/availability", charge_point_id);
-        let last_will = LastWill::new(
-            &availability_topic,
-            "offline",
-            QoS::AtLeastOnce,
-            true,
-        );
-        mqttoptions.set_last_will(last_will);
+        // Configure Last Will and Testament.
+        //
+        // Only possible when the Charge Point ID is known from configuration:
+        // the will has to be registered in the CONNECT packet, before any
+        // charger has connected to tell us its ID.
+        if let Some(id) = &lwt_charge_point_id {
+            let availability_topic = availability_topic(id);
+            mqttoptions.set_last_will(LastWill::new(
+                &availability_topic,
+                "offline",
+                QoS::AtLeastOnce,
+                true,
+            ));
+        } else {
+            warn!(
+                component = "mqtt",
+                "No charge_point_id configured: connecting without a Last Will. \
+                 Home Assistant will not be told if this proxy dies unexpectedly."
+            );
+        }
 
-        // Configure TLS with certificate verification
-        let tls_config = Self::build_tls_config(mqtt_config)?;
-        mqttoptions.set_transport(Transport::Tls(tls_config));
+        // TLS is optional. The broker is one LAN hop away on the Home
+        // Assistant VM, not across the internet, so plaintext with
+        // username/password is a reasonable default.
+        if let Some(tls_config) = Self::build_tls_config(mqtt_config)? {
+            mqttoptions.set_transport(Transport::Tls(tls_config));
+        }
 
         // Create client and event loop
         let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
@@ -152,7 +169,7 @@ impl MqttPublisher {
         Ok(Self {
             client,
             eventloop,
-            charge_point_id,
+            lwt_charge_point_id,
             event_rx,
             buffer: VecDeque::new(),
             max_buffer_size,
@@ -164,37 +181,45 @@ impl MqttPublisher {
         })
     }
 
-    /// Build TLS configuration from certificate files.
+    /// Build TLS configuration from certificate files, if TLS is configured.
     ///
-    /// Reads CA cert, client cert, and client key from the configured file paths.
-    /// Uses rustls (via rumqttc's `use-rustls` feature) for TLS 1.2+.
-    fn build_tls_config(mqtt_config: &MqttConfig) -> Result<TlsConfiguration, ProxyError> {
-        let ca_cert = fs::read(&mqtt_config.ca_cert_path).map_err(|e| ProxyError::Tls {
-            description: format!(
-                "Failed to read CA certificate at '{}': {}",
-                mqtt_config.ca_cert_path, e
-            ),
+    /// Returns `None` when no CA certificate is configured, meaning a plaintext
+    /// connection. Uses rustls (rumqttc's `use-rustls` feature) for TLS 1.2+.
+    fn build_tls_config(mqtt_config: &MqttConfig) -> Result<Option<TlsConfiguration>, ProxyError> {
+        let Some(ca_path) = mqtt_config.ca_cert_path.as_ref() else {
+            return Ok(None);
+        };
+
+        let ca_cert = fs::read(ca_path).map_err(|e| ProxyError::Tls {
+            description: format!("Failed to read CA certificate at '{}': {}", ca_path, e),
         })?;
 
-        let client_cert = fs::read(&mqtt_config.client_cert_path).map_err(|e| ProxyError::Tls {
-            description: format!(
-                "Failed to read client certificate at '{}': {}",
-                mqtt_config.client_cert_path, e
-            ),
-        })?;
+        // Config validation rejects one without the other, so either both are
+        // present or neither is.
+        let client_auth = match (
+            mqtt_config.client_cert_path.as_ref(),
+            mqtt_config.client_key_path.as_ref(),
+        ) {
+            (Some(cert_path), Some(key_path)) => {
+                let client_cert = fs::read(cert_path).map_err(|e| ProxyError::Tls {
+                    description: format!(
+                        "Failed to read client certificate at '{}': {}",
+                        cert_path, e
+                    ),
+                })?;
+                let client_key = fs::read(key_path).map_err(|e| ProxyError::Tls {
+                    description: format!("Failed to read client key at '{}': {}", key_path, e),
+                })?;
+                Some((client_cert, client_key))
+            }
+            _ => None,
+        };
 
-        let client_key = fs::read(&mqtt_config.client_key_path).map_err(|e| ProxyError::Tls {
-            description: format!(
-                "Failed to read client key at '{}': {}",
-                mqtt_config.client_key_path, e
-            ),
-        })?;
-
-        Ok(TlsConfiguration::Simple {
+        Ok(Some(TlsConfiguration::Simple {
             ca: ca_cert,
             alpn: None,
-            client_auth: Some((client_cert, client_key)),
-        })
+            client_auth,
+        }))
     }
 
     /// Attempt to connect to the MQTT broker with a startup timeout.
@@ -207,7 +232,7 @@ impl MqttPublisher {
         self.state = ConnectionState::Connecting;
         info!(
             component = "mqtt",
-            charge_point_id = %self.charge_point_id,
+            charge_point_id = self.lwt_id(),
             "Attempting MQTT connection (timeout: {:?})",
             timeout
         );
@@ -219,7 +244,7 @@ impl MqttPublisher {
             if remaining.is_zero() {
                 warn!(
                     component = "mqtt",
-                    charge_point_id = %self.charge_point_id,
+                    charge_point_id = self.lwt_id(),
                     "MQTT connection timeout after {:?}, proceeding without MQTT",
                     timeout
                 );
@@ -231,7 +256,7 @@ impl MqttPublisher {
                 Ok(Ok(Event::Incoming(Incoming::ConnAck(_)))) => {
                     info!(
                         component = "mqtt",
-                        charge_point_id = %self.charge_point_id,
+                        charge_point_id = self.lwt_id(),
                         "MQTT connected successfully"
                     );
                     self.state = ConnectionState::Connected;
@@ -241,7 +266,7 @@ impl MqttPublisher {
                     if let Err(e) = self.publish_online().await {
                         warn!(
                             component = "mqtt",
-                            charge_point_id = %self.charge_point_id,
+                            charge_point_id = self.lwt_id(),
                             "Failed to publish online status: {}",
                             e
                         );
@@ -256,7 +281,7 @@ impl MqttPublisher {
                 Ok(Err(e)) => {
                     debug!(
                         component = "mqtt",
-                        charge_point_id = %self.charge_point_id,
+                        charge_point_id = self.lwt_id(),
                         "MQTT connection attempt failed: {}",
                         e
                     );
@@ -269,7 +294,7 @@ impl MqttPublisher {
                     // Timeout elapsed
                     warn!(
                         component = "mqtt",
-                        charge_point_id = %self.charge_point_id,
+                        charge_point_id = self.lwt_id(),
                         "MQTT connection timeout after {:?}, proceeding without MQTT",
                         timeout
                     );
@@ -284,7 +309,12 @@ impl MqttPublisher {
     ///
     /// Called after successful connection to the broker.
     pub async fn publish_online(&self) -> Result<(), ProxyError> {
-        let topic = format!("ocpp/{}/availability", self.charge_point_id);
+        // Without a configured ID there is no availability topic to own, and
+        // no Last Will was registered either. Nothing to announce.
+        let Some(id) = self.lwt_charge_point_id.as_deref() else {
+            return Ok(());
+        };
+        let topic = availability_topic(id);
         self.client
             .publish(&topic, QoS::AtLeastOnce, true, "online")
             .await
@@ -294,7 +324,7 @@ impl MqttPublisher {
 
         debug!(
             component = "mqtt",
-            charge_point_id = %self.charge_point_id,
+            charge_point_id = self.lwt_id(),
             topic = %topic,
             "Published online availability status (retained)"
         );
@@ -312,7 +342,7 @@ impl MqttPublisher {
     pub async fn run(&mut self) {
         info!(
             component = "mqtt",
-            charge_point_id = %self.charge_point_id,
+            charge_point_id = self.lwt_id(),
             "MQTT publisher event loop started"
         );
 
@@ -324,7 +354,7 @@ impl MqttPublisher {
                         Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                             info!(
                                 component = "mqtt",
-                                charge_point_id = %self.charge_point_id,
+                                charge_point_id = self.lwt_id(),
                                 "MQTT reconnected"
                             );
                             self.state = ConnectionState::Connected;
@@ -334,7 +364,7 @@ impl MqttPublisher {
                             if let Err(e) = self.publish_online().await {
                                 warn!(
                                     component = "mqtt",
-                                    charge_point_id = %self.charge_point_id,
+                                    charge_point_id = self.lwt_id(),
                                     "Failed to publish online status on reconnect: {}",
                                     e
                                 );
@@ -350,7 +380,7 @@ impl MqttPublisher {
                             if self.state == ConnectionState::Connected {
                                 warn!(
                                     component = "mqtt",
-                                    charge_point_id = %self.charge_point_id,
+                                    charge_point_id = self.lwt_id(),
                                     "MQTT connection lost: {}",
                                     e
                                 );
@@ -361,7 +391,7 @@ impl MqttPublisher {
                             let delay = self.backoff.next_delay();
                             debug!(
                                 component = "mqtt",
-                                charge_point_id = %self.charge_point_id,
+                                charge_point_id = self.lwt_id(),
                                 delay_ms = delay.as_millis(),
                                 "MQTT reconnection backoff"
                             );
@@ -379,7 +409,7 @@ impl MqttPublisher {
                             // Channel closed — publisher shutting down
                             info!(
                                 component = "mqtt",
-                                charge_point_id = %self.charge_point_id,
+                                charge_point_id = self.lwt_id(),
                                 "MQTT event channel closed, shutting down publisher"
                             );
                             break;
@@ -394,13 +424,14 @@ impl MqttPublisher {
     async fn handle_event(&mut self, event: MqttEvent) {
         match event {
             MqttEvent::MessageForwarded {
+                charge_point_id,
                 frame,
                 direction,
                 action,
             } => {
                 // Construct MQTT topic: ocpp/{charge_point_id}/{direction}/{action}
                 let dir_str = direction_str(direction);
-                let topic = message_topic(&self.charge_point_id, dir_str, &action);
+                let topic = message_topic(&charge_point_id, dir_str, &action);
 
                 // Parse the raw OCPP JSON for the payload field
                 let payload_value = serde_json::from_str::<serde_json::Value>(&frame.raw)
@@ -418,7 +449,7 @@ impl MqttPublisher {
                     Err(e) => {
                         warn!(
                             component = "mqtt",
-                            charge_point_id = %self.charge_point_id,
+                            charge_point_id = self.lwt_id(),
                             error = %e,
                             "Failed to serialize MQTT payload"
                         );
@@ -435,7 +466,7 @@ impl MqttPublisher {
                     {
                         warn!(
                             component = "mqtt",
-                            charge_point_id = %self.charge_point_id,
+                            charge_point_id = self.lwt_id(),
                             topic = %topic,
                             error = %e,
                             "Failed to publish MQTT message, buffering"
@@ -449,7 +480,7 @@ impl MqttPublisher {
                     } else {
                         debug!(
                             component = "mqtt",
-                            charge_point_id = %self.charge_point_id,
+                            charge_point_id = self.lwt_id(),
                             topic = %topic,
                             "Published OCPP event to MQTT"
                         );
@@ -458,7 +489,7 @@ impl MqttPublisher {
                     // Broker unreachable — buffer the message
                     debug!(
                         component = "mqtt",
-                        charge_point_id = %self.charge_point_id,
+                        charge_point_id = self.lwt_id(),
                         topic = %topic,
                         "Broker unreachable, buffering MQTT message"
                     );
@@ -471,11 +502,12 @@ impl MqttPublisher {
                 }
             }
             MqttEvent::StateChange {
+                charge_point_id,
                 upstream,
                 downstream,
             } => {
                 // Construct status topic: ocpp/{charge_point_id}/status
-                let topic = status_topic(&self.charge_point_id);
+                let topic = status_topic(&charge_point_id);
 
                 // Construct status payload
                 let status_payload = StatusPayload {
@@ -488,7 +520,7 @@ impl MqttPublisher {
                     Err(e) => {
                         warn!(
                             component = "mqtt",
-                            charge_point_id = %self.charge_point_id,
+                            charge_point_id = self.lwt_id(),
                             error = %e,
                             "Failed to serialize status payload"
                         );
@@ -505,7 +537,7 @@ impl MqttPublisher {
                     {
                         warn!(
                             component = "mqtt",
-                            charge_point_id = %self.charge_point_id,
+                            charge_point_id = self.lwt_id(),
                             topic = %topic,
                             error = %e,
                             "Failed to publish status message, buffering"
@@ -519,7 +551,7 @@ impl MqttPublisher {
                     } else {
                         debug!(
                             component = "mqtt",
-                            charge_point_id = %self.charge_point_id,
+                            charge_point_id = self.lwt_id(),
                             topic = %topic,
                             "Published connection status to MQTT (retained)"
                         );
@@ -528,7 +560,7 @@ impl MqttPublisher {
                     // Broker unreachable — buffer the message
                     debug!(
                         component = "mqtt",
-                        charge_point_id = %self.charge_point_id,
+                        charge_point_id = self.lwt_id(),
                         topic = %topic,
                         "Broker unreachable, buffering status message"
                     );
@@ -552,7 +584,7 @@ impl MqttPublisher {
             if let Some(msg) = evicted {
                 warn!(
                     component = "mqtt",
-                    charge_point_id = %self.charge_point_id,
+                    charge_point_id = self.lwt_id(),
                     topic = %msg.topic,
                     "MQTT buffer full, evicting oldest message"
                 );
@@ -572,17 +604,21 @@ impl MqttPublisher {
 
         info!(
             component = "mqtt",
-            charge_point_id = %self.charge_point_id,
+            charge_point_id = self.lwt_id(),
             count = count,
             "Flushing buffered MQTT messages"
         );
 
         let mut published = 0;
         while let Some(msg) = self.buffer.pop_front() {
-            if let Err(e) = self.client.publish(&msg.topic, msg.qos, msg.retain, msg.payload.clone()).await {
+            if let Err(e) = self
+                .client
+                .publish(&msg.topic, msg.qos, msg.retain, msg.payload.clone())
+                .await
+            {
                 warn!(
                     component = "mqtt",
-                    charge_point_id = %self.charge_point_id,
+                    charge_point_id = self.lwt_id(),
                     topic = %msg.topic,
                     error = %e,
                     "Failed to publish buffered message, re-buffering"
@@ -597,7 +633,7 @@ impl MqttPublisher {
         if published > 0 {
             info!(
                 component = "mqtt",
-                charge_point_id = %self.charge_point_id,
+                charge_point_id = self.lwt_id(),
                 published = published,
                 remaining = self.buffer.len(),
                 "Flushed buffered MQTT messages"
@@ -620,9 +656,14 @@ impl MqttPublisher {
         &self.client
     }
 
-    /// Get the charge point ID.
-    pub fn charge_point_id(&self) -> &str {
-        &self.charge_point_id
+    /// The Charge Point ID used for the availability topic, if configured.
+    pub fn lwt_charge_point_id(&self) -> Option<&str> {
+        self.lwt_charge_point_id.as_deref()
+    }
+
+    /// Display form of the Last Will charge point ID, for log fields.
+    fn lwt_id(&self) -> &str {
+        self.lwt_charge_point_id.as_deref().unwrap_or("-")
     }
 }
 
@@ -647,10 +688,7 @@ mod tests {
 
     #[test]
     fn test_availability_topic_construction() {
-        assert_eq!(
-            availability_topic("CP001"),
-            "ocpp/CP001/availability"
-        );
+        assert_eq!(availability_topic("CP001"), "ocpp/CP001/availability");
     }
 
     #[test]
@@ -679,10 +717,7 @@ mod tests {
 
     #[test]
     fn test_status_topic_construction() {
-        assert_eq!(
-            status_topic("CP001"),
-            "ocpp/CP001/status"
-        );
+        assert_eq!(status_topic("CP001"), "ocpp/CP001/status");
     }
 
     #[test]
@@ -730,12 +765,7 @@ mod tests {
         mqttoptions.set_keep_alive(Duration::from_secs(60));
 
         let availability_topic = format!("ocpp/{}/availability", "CP001");
-        let last_will = LastWill::new(
-            &availability_topic,
-            "offline",
-            QoS::AtLeastOnce,
-            true,
-        );
+        let last_will = LastWill::new(&availability_topic, "offline", QoS::AtLeastOnce, true);
         mqttoptions.set_last_will(last_will);
 
         // Verify keepalive
@@ -755,10 +785,8 @@ mod tests {
     #[test]
     fn test_exponential_backoff_for_mqtt() {
         // MQTT uses 1s initial, 30s max as specified in requirement 6.3
-        let mut backoff = ExponentialBackoff::with_defaults(
-            Duration::from_secs(1),
-            Duration::from_secs(30),
-        );
+        let mut backoff =
+            ExponentialBackoff::with_defaults(Duration::from_secs(1), Duration::from_secs(30));
 
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
         assert_eq!(backoff.next_delay(), Duration::from_secs(2));
@@ -772,10 +800,8 @@ mod tests {
 
     #[test]
     fn test_exponential_backoff_reset_for_mqtt() {
-        let mut backoff = ExponentialBackoff::with_defaults(
-            Duration::from_secs(1),
-            Duration::from_secs(30),
-        );
+        let mut backoff =
+            ExponentialBackoff::with_defaults(Duration::from_secs(1), Duration::from_secs(30));
 
         backoff.next_delay();
         backoff.next_delay();
@@ -809,9 +835,9 @@ mod tests {
             port: 8883,
             username: "user".to_string(),
             password: "pass".to_string(),
-            ca_cert_path: "/nonexistent/ca.pem".to_string(),
-            client_cert_path: "/nonexistent/cert.pem".to_string(),
-            client_key_path: "/nonexistent/key.pem".to_string(),
+            ca_cert_path: Some("/nonexistent/ca.pem".to_string()),
+            client_cert_path: Some("/nonexistent/cert.pem".to_string()),
+            client_key_path: Some("/nonexistent/key.pem".to_string()),
         };
 
         let result = MqttPublisher::build_tls_config(&config);
@@ -832,9 +858,9 @@ mod tests {
             port: 8883,
             username: "user".to_string(),
             password: "pass".to_string(),
-            ca_cert_path: tmp.path().to_str().unwrap().to_string(),
-            client_cert_path: "/nonexistent/cert.pem".to_string(),
-            client_key_path: "/nonexistent/key.pem".to_string(),
+            ca_cert_path: Some(tmp.path().to_str().unwrap().to_string()),
+            client_cert_path: Some("/nonexistent/cert.pem".to_string()),
+            client_key_path: Some("/nonexistent/key.pem".to_string()),
         };
 
         let result = MqttPublisher::build_tls_config(&config);
@@ -856,9 +882,9 @@ mod tests {
             port: 8883,
             username: "user".to_string(),
             password: "pass".to_string(),
-            ca_cert_path: ca_tmp.path().to_str().unwrap().to_string(),
-            client_cert_path: cert_tmp.path().to_str().unwrap().to_string(),
-            client_key_path: "/nonexistent/key.pem".to_string(),
+            ca_cert_path: Some(ca_tmp.path().to_str().unwrap().to_string()),
+            client_cert_path: Some(cert_tmp.path().to_str().unwrap().to_string()),
+            client_key_path: Some("/nonexistent/key.pem".to_string()),
         };
 
         let result = MqttPublisher::build_tls_config(&config);
@@ -882,9 +908,9 @@ mod tests {
             port: 8883,
             username: "user".to_string(),
             password: "pass".to_string(),
-            ca_cert_path: ca_tmp.path().to_str().unwrap().to_string(),
-            client_cert_path: cert_tmp.path().to_str().unwrap().to_string(),
-            client_key_path: key_tmp.path().to_str().unwrap().to_string(),
+            ca_cert_path: Some(ca_tmp.path().to_str().unwrap().to_string()),
+            client_cert_path: Some(cert_tmp.path().to_str().unwrap().to_string()),
+            client_key_path: Some(key_tmp.path().to_str().unwrap().to_string()),
         };
 
         let result = MqttPublisher::build_tls_config(&config);
@@ -905,17 +931,17 @@ mod tests {
             port: 8883,
             username: "user".to_string(),
             password: "pass".to_string(),
-            ca_cert_path: ca_tmp.path().to_str().unwrap().to_string(),
-            client_cert_path: cert_tmp.path().to_str().unwrap().to_string(),
-            client_key_path: key_tmp.path().to_str().unwrap().to_string(),
+            ca_cert_path: Some(ca_tmp.path().to_str().unwrap().to_string()),
+            client_cert_path: Some(cert_tmp.path().to_str().unwrap().to_string()),
+            client_key_path: Some(key_tmp.path().to_str().unwrap().to_string()),
         };
 
         let (_tx, rx) = mpsc::channel(100);
-        let publisher = MqttPublisher::new(&config, "CP001".to_string(), rx, 500);
+        let publisher = MqttPublisher::new(&config, Some("CP001".to_string()), rx, 500);
         assert!(publisher.is_ok());
 
         let publisher = publisher.unwrap();
-        assert_eq!(publisher.charge_point_id(), "CP001");
+        assert_eq!(publisher.lwt_charge_point_id().unwrap(), "CP001");
         assert_eq!(publisher.state(), ConnectionState::Disconnected);
         assert_eq!(publisher.buffer_len(), 0);
     }
@@ -927,13 +953,13 @@ mod tests {
             port: 8883,
             username: "user".to_string(),
             password: "pass".to_string(),
-            ca_cert_path: "/nonexistent/ca.pem".to_string(),
-            client_cert_path: "/nonexistent/cert.pem".to_string(),
-            client_key_path: "/nonexistent/key.pem".to_string(),
+            ca_cert_path: Some("/nonexistent/ca.pem".to_string()),
+            client_cert_path: Some("/nonexistent/cert.pem".to_string()),
+            client_key_path: Some("/nonexistent/key.pem".to_string()),
         };
 
         let (_tx, rx) = mpsc::channel(100);
-        let result = MqttPublisher::new(&config, "CP001".to_string(), rx, 500);
+        let result = MqttPublisher::new(&config, Some("CP001".to_string()), rx, 500);
         assert!(result.is_err());
     }
 
@@ -969,10 +995,22 @@ mod tests {
 
     #[test]
     fn test_connection_state_str_all_states() {
-        assert_eq!(connection_state_str(ConnectionState::Connected), "connected");
-        assert_eq!(connection_state_str(ConnectionState::Disconnected), "disconnected");
-        assert_eq!(connection_state_str(ConnectionState::Reconnecting), "reconnecting");
-        assert_eq!(connection_state_str(ConnectionState::Connecting), "connecting");
+        assert_eq!(
+            connection_state_str(ConnectionState::Connected),
+            "connected"
+        );
+        assert_eq!(
+            connection_state_str(ConnectionState::Disconnected),
+            "disconnected"
+        );
+        assert_eq!(
+            connection_state_str(ConnectionState::Reconnecting),
+            "reconnecting"
+        );
+        assert_eq!(
+            connection_state_str(ConnectionState::Connecting),
+            "connecting"
+        );
     }
 
     #[test]
@@ -1088,7 +1126,11 @@ mod tests {
         // Verify the timestamp is a valid RFC3339/ISO8601 string
         let ts_str = json["timestamp"].as_str().unwrap();
         let parsed = chrono::DateTime::parse_from_rfc3339(ts_str);
-        assert!(parsed.is_ok(), "Timestamp should be valid ISO 8601: {}", ts_str);
+        assert!(
+            parsed.is_ok(),
+            "Timestamp should be valid ISO 8601: {}",
+            ts_str
+        );
     }
 
     #[test]

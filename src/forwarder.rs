@@ -19,6 +19,9 @@ use crate::models::{ConnectionState, Direction, OcppFrame, OcppMessageType};
 pub enum MqttEvent {
     /// An OCPP message was successfully forwarded.
     MessageForwarded {
+        /// The charger this message belongs to. Topics are per charge point,
+        /// so the publisher cannot infer it.
+        charge_point_id: String,
         /// The complete OCPP frame (including raw JSON).
         frame: OcppFrame,
         /// Direction the message was forwarded in.
@@ -28,6 +31,8 @@ pub enum MqttEvent {
     },
     /// Connection state changed.
     StateChange {
+        /// The charger whose connection state changed.
+        charge_point_id: String,
         /// Current upstream connection state.
         upstream: ConnectionState,
         /// Current downstream connection state.
@@ -180,6 +185,10 @@ pub struct MessageForwarder {
     mqtt_tx: mpsc::Sender<MqttEvent>,
     /// Tracks Call messages to resolve actions for CallResult/CallError.
     call_tracker: CallTracker,
+    /// The charger this forwarder serves. Stamped onto every MQTT event so the
+    /// publisher builds `ocpp/{id}/...` topics for the real charge point
+    /// rather than a placeholder.
+    charge_point_id: String,
 }
 
 impl MessageForwarder {
@@ -196,6 +205,23 @@ impl MessageForwarder {
         max_buffer_duration: Duration,
         call_tracker_max_age: Duration,
     ) -> Self {
+        Self::with_charge_point_id(
+            mqtt_tx,
+            max_buffer_size,
+            max_buffer_duration,
+            call_tracker_max_age,
+            "unknown".to_string(),
+        )
+    }
+
+    /// Create a `MessageForwarder` bound to a specific Charge Point ID.
+    pub fn with_charge_point_id(
+        mqtt_tx: mpsc::Sender<MqttEvent>,
+        max_buffer_size: usize,
+        max_buffer_duration: Duration,
+        call_tracker_max_age: Duration,
+        charge_point_id: String,
+    ) -> Self {
         Self {
             upstream_buffer: VecDeque::new(),
             downstream_buffer: VecDeque::new(),
@@ -203,7 +229,13 @@ impl MessageForwarder {
             max_buffer_duration,
             mqtt_tx,
             call_tracker: CallTracker::new(call_tracker_max_age),
+            charge_point_id,
         }
+    }
+
+    /// The Charge Point ID this forwarder serves.
+    pub fn charge_point_id(&self) -> &str {
+        &self.charge_point_id
     }
 
     /// Forward a message from the charger to the central system (upstream).
@@ -265,6 +297,7 @@ impl MessageForwarder {
 
         // Step 4: Send MQTT event AFTER successful forwarding (non-blocking)
         let mqtt_event = MqttEvent::MessageForwarded {
+            charge_point_id: self.charge_point_id.clone(),
             frame,
             direction,
             action,
@@ -294,17 +327,16 @@ impl MessageForwarder {
                     .track_call(&frame.unique_id, action, direction);
                 action.clone()
             }
-            OcppMessageType::CallResult | OcppMessageType::CallError => {
-                self.call_tracker
-                    .resolve(&frame.unique_id)
-                    .unwrap_or_else(|| {
-                        warn!(
-                            unique_id = %frame.unique_id,
-                            "No originating Call found for response; using 'Unknown'"
-                        );
-                        "Unknown".to_string()
-                    })
-            }
+            OcppMessageType::CallResult | OcppMessageType::CallError => self
+                .call_tracker
+                .resolve(&frame.unique_id)
+                .unwrap_or_else(|| {
+                    warn!(
+                        unique_id = %frame.unique_id,
+                        "No originating Call found for response; using 'Unknown'"
+                    );
+                    "Unknown".to_string()
+                }),
         }
     }
 
@@ -582,10 +614,7 @@ mod tests {
 
     fn make_call_frame(unique_id: &str, action: &str) -> OcppFrame {
         OcppFrame {
-            raw: format!(
-                r#"[2, "{}", "{}", {{}}]"#,
-                unique_id, action
-            ),
+            raw: format!(r#"[2, "{}", "{}", {{}}]"#, unique_id, action),
             message_type: OcppMessageType::Call {
                 action: action.to_string(),
             },
@@ -724,6 +753,7 @@ mod tests {
                 frame,
                 direction,
                 action,
+                ..
             } => {
                 assert_eq!(frame.unique_id, "evt-1");
                 assert_eq!(direction, Direction::ChargerToCentral);
@@ -783,10 +813,7 @@ mod tests {
 
         // Forward a Call
         let call = make_call_frame("err-1", "Authorize");
-        forwarder
-            .forward_downstream(call, &mut sink)
-            .await
-            .unwrap();
+        forwarder.forward_downstream(call, &mut sink).await.unwrap();
 
         // Forward the CallError
         let error = make_call_error_frame("err-1");

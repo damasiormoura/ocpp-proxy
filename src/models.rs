@@ -70,15 +70,13 @@ impl OcppFrame {
                         description: "Call message must have at least 4 elements".to_string(),
                     });
                 }
-                let action =
-                    arr[2]
-                        .as_str()
-                        .ok_or_else(|| ProxyError::Protocol {
-                            description:
-                                "Third element of Call message must be a string (Action)"
-                                    .to_string(),
-                        })?
-                        .to_string();
+                let action = arr[2]
+                    .as_str()
+                    .ok_or_else(|| ProxyError::Protocol {
+                        description: "Third element of Call message must be a string (Action)"
+                            .to_string(),
+                    })?
+                    .to_string();
                 OcppMessageType::Call { action }
             }
             3 => OcppMessageType::CallResult,
@@ -190,7 +188,8 @@ impl ExponentialBackoff {
     /// `current` is updated to `min(current * multiplier, max)`.
     pub fn next_delay(&mut self) -> Duration {
         let delay = self.current.min(self.max);
-        let next_millis = (self.current.as_secs_f64() * self.multiplier).min(self.max.as_secs_f64());
+        let next_millis =
+            (self.current.as_secs_f64() * self.multiplier).min(self.max.as_secs_f64());
         self.current = Duration::from_secs_f64(next_millis);
         delay
     }
@@ -230,8 +229,7 @@ mod tests {
 
     #[test]
     fn test_parse_call_error_message() {
-        let raw =
-            r#"[4, "abc123", "InternalError", "Something went wrong", {}]"#;
+        let raw = r#"[4, "abc123", "InternalError", "Something went wrong", {}]"#;
         let frame = OcppFrame::parse(raw).unwrap();
         assert_eq!(frame.raw, raw);
         assert_eq!(frame.unique_id, "abc123");
@@ -279,11 +277,8 @@ mod tests {
 
     #[test]
     fn test_exponential_backoff_sequence() {
-        let mut backoff = ExponentialBackoff::new(
-            Duration::from_secs(2),
-            Duration::from_secs(60),
-            2.0,
-        );
+        let mut backoff =
+            ExponentialBackoff::new(Duration::from_secs(2), Duration::from_secs(60), 2.0);
 
         assert_eq!(backoff.next_delay(), Duration::from_secs(2));
         assert_eq!(backoff.next_delay(), Duration::from_secs(4));
@@ -298,10 +293,8 @@ mod tests {
 
     #[test]
     fn test_exponential_backoff_reset() {
-        let mut backoff = ExponentialBackoff::with_defaults(
-            Duration::from_secs(1),
-            Duration::from_secs(30),
-        );
+        let mut backoff =
+            ExponentialBackoff::with_defaults(Duration::from_secs(1), Duration::from_secs(30));
 
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
         assert_eq!(backoff.next_delay(), Duration::from_secs(2));
@@ -315,11 +308,8 @@ mod tests {
 
     #[test]
     fn test_exponential_backoff_never_exceeds_max() {
-        let mut backoff = ExponentialBackoff::new(
-            Duration::from_secs(1),
-            Duration::from_secs(10),
-            3.0,
-        );
+        let mut backoff =
+            ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(10), 3.0);
 
         for _ in 0..20 {
             let delay = backoff.next_delay();

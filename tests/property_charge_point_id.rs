@@ -10,7 +10,7 @@
 use proptest::prelude::*;
 use url::Url;
 
-use ocpp_proxy::upstream::UpstreamHandler;
+use ocpp_proxy::upstream::build_upstream_url;
 
 /// Strategy to generate valid Charge Point IDs.
 ///
@@ -30,21 +30,18 @@ fn valid_charge_point_id() -> impl Strategy<Value = String> {
 fn valid_central_system_url() -> impl Strategy<Value = Url> {
     prop_oneof![
         // wss://hostname (no path)
-        "[a-z]{3,10}\\.[a-z]{2,6}".prop_map(|host| {
-            Url::parse(&format!("wss://{}", host)).unwrap()
-        }),
+        "[a-z]{3,10}\\.[a-z]{2,6}"
+            .prop_map(|host| { Url::parse(&format!("wss://{}", host)).unwrap() }),
         // wss://hostname/path
-        ("[a-z]{3,10}\\.[a-z]{2,6}", "[a-z]{2,10}").prop_map(|(host, path)| {
-            Url::parse(&format!("wss://{}/{}", host, path)).unwrap()
-        }),
+        ("[a-z]{3,10}\\.[a-z]{2,6}", "[a-z]{2,10}")
+            .prop_map(|(host, path)| { Url::parse(&format!("wss://{}/{}", host, path)).unwrap() }),
         // wss://hostname/multi/path
-        ("[a-z]{3,10}\\.[a-z]{2,6}", "[a-z]{2,8}", "[a-z]{2,8}").prop_map(
-            |(host, p1, p2)| { Url::parse(&format!("wss://{}/{}/{}", host, p1, p2)).unwrap() }
-        ),
-        // ws://hostname:port
-        ("[a-z]{3,10}\\.[a-z]{2,6}", 1024u16..65535u16).prop_map(|(host, port)| {
-            Url::parse(&format!("ws://{}:{}", host, port)).unwrap()
+        ("[a-z]{3,10}\\.[a-z]{2,6}", "[a-z]{2,8}", "[a-z]{2,8}").prop_map(|(host, p1, p2)| {
+            Url::parse(&format!("wss://{}/{}/{}", host, p1, p2)).unwrap()
         }),
+        // ws://hostname:port
+        ("[a-z]{3,10}\\.[a-z]{2,6}", 1024u16..65535u16)
+            .prop_map(|(host, port)| { Url::parse(&format!("ws://{}:{}", host, port)).unwrap() }),
         // ws://hostname:port/path
         ("[a-z]{3,10}\\.[a-z]{2,6}", 1024u16..65535u16, "[a-z]{2,10}").prop_map(
             |(host, port, path)| {
@@ -52,9 +49,8 @@ fn valid_central_system_url() -> impl Strategy<Value = Url> {
             }
         ),
         // wss with trailing slash
-        "[a-z]{3,10}\\.[a-z]{2,6}".prop_map(|host| {
-            Url::parse(&format!("wss://{}/", host)).unwrap()
-        }),
+        "[a-z]{3,10}\\.[a-z]{2,6}"
+            .prop_map(|host| { Url::parse(&format!("wss://{}/", host)).unwrap() }),
     ]
 }
 
@@ -70,13 +66,7 @@ proptest! {
         base_url in valid_central_system_url(),
         charge_point_id in valid_charge_point_id(),
     ) {
-        let handler = UpstreamHandler::new(
-            base_url.clone(),
-            charge_point_id.clone(),
-            "ocpp1.6".to_string(),
-        );
-
-        let connection_url = handler.build_connection_url();
+        let connection_url = build_upstream_url(&base_url, &charge_point_id);
         let url_path = connection_url.path();
 
         // The URL path must end with the exact charge_point_id
@@ -100,13 +90,7 @@ proptest! {
         base_url in valid_central_system_url(),
         charge_point_id in valid_charge_point_id(),
     ) {
-        let handler = UpstreamHandler::new(
-            base_url.clone(),
-            charge_point_id.clone(),
-            "ocpp1.6".to_string(),
-        );
-
-        let connection_url = handler.build_connection_url();
+        let connection_url = build_upstream_url(&base_url, &charge_point_id);
         let url_str = connection_url.as_str();
 
         // The charge_point_id must appear literally in the URL (no percent-encoding)
@@ -130,13 +114,7 @@ proptest! {
         base_url in valid_central_system_url(),
         charge_point_id in valid_charge_point_id(),
     ) {
-        let handler = UpstreamHandler::new(
-            base_url.clone(),
-            charge_point_id.clone(),
-            "ocpp1.6".to_string(),
-        );
-
-        let connection_url = handler.build_connection_url();
+        let connection_url = build_upstream_url(&base_url, &charge_point_id);
         let url_path = connection_url.path();
 
         // Split path into segments and verify the last one matches

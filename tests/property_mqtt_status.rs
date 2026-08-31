@@ -92,10 +92,22 @@ fn exhaustive_status_message_all_16_combinations() {
 /// **Validates: Requirements 5.6**
 #[test]
 fn connection_state_str_maps_correctly() {
-    assert_eq!(connection_state_str(ConnectionState::Connected), "connected");
-    assert_eq!(connection_state_str(ConnectionState::Disconnected), "disconnected");
-    assert_eq!(connection_state_str(ConnectionState::Reconnecting), "reconnecting");
-    assert_eq!(connection_state_str(ConnectionState::Connecting), "connecting");
+    assert_eq!(
+        connection_state_str(ConnectionState::Connected),
+        "connected"
+    );
+    assert_eq!(
+        connection_state_str(ConnectionState::Disconnected),
+        "disconnected"
+    );
+    assert_eq!(
+        connection_state_str(ConnectionState::Reconnecting),
+        "reconnecting"
+    );
+    assert_eq!(
+        connection_state_str(ConnectionState::Connecting),
+        "connecting"
+    );
 }
 
 /// Verify that the serialized status payload contains exactly two fields:

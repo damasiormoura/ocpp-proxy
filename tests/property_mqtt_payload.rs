@@ -78,11 +78,7 @@ fn arb_call_message() -> impl Strategy<Value = (Value, OcppMessageType)> {
 /// Format: [3, UniqueId, Payload]
 fn arb_call_result_message() -> impl Strategy<Value = (Value, OcppMessageType)> {
     (arb_unique_id(), arb_json_object()).prop_map(|(uid, payload)| {
-        let arr = Value::Array(vec![
-            Value::Number(3.into()),
-            Value::String(uid),
-            payload,
-        ]);
+        let arr = Value::Array(vec![Value::Number(3.into()), Value::String(uid), payload]);
         (arr, OcppMessageType::CallResult)
     })
 }

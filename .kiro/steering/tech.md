@@ -11,7 +11,7 @@
 |-------|---------|
 | tokio (full) | Async runtime |
 | axum (ws) | Downstream WebSocket server + health HTTP endpoint |
-| tokio-tungstenite (native-tls) | Upstream WebSocket client to Central System |
+| tokio-tungstenite (rustls) | Upstream WebSocket client to Central System — moving off native-tls to drop the OpenSSL dependency |
 | rumqttc (use-rustls) | MQTT 3.1.1 client with TLS |
 | futures-util | Stream/Sink utilities for WebSocket handling |
 | serde / serde_json | JSON serialization for config, MQTT payloads, health |

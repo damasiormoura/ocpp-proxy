@@ -1,0 +1,17 @@
+# Pin the ZTE 4G dongle to a stable interface name.
+#
+# Why this exists: the dongle binds cdc_ether and the kernel derives an "enx*"
+# name from its MAC. Before a SIM is registered it presents the placeholder MAC
+# 34:4b:50:00:00:00, giving "enx344b50000000". That MAC is expected to change
+# once a SIM is inserted, which renames the interface and silently breaks every
+# route, rule and firewall entry that names it. Match on the USB IDs instead.
+#
+# Install to /etc/systemd/network/10-wwan.link on the Proxmox host, then:
+#   udevadm control --reload && udevadm trigger --subsystem-match=net
+# Replug the dongle (or reboot) for the rename to take effect.
+
+[Match]
+Property=ID_VENDOR_ID=19d2 ID_MODEL_ID=1405
+
+[Link]
+Name=wwan0

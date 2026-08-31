@@ -1,0 +1,76 @@
+# OCPP proxy configuration for the Proxmox LXC deployment.
+# Install to /etc/ocpp-proxy/config.yaml (mode 644, root:ocpp).
+# Secrets do NOT go here — see secrets.env.
+
+# --- Mobi.e Central System -------------------------------------------------
+# CONFIRM after the SIM is in: the exact URL Mobi.e issued for this charge
+# point, and whether its hostname resolves through public DNS or only through
+# the APN's resolvers. If only through the APN, add a domain-specific
+# "server=/<zone>/<apn-dns>" entry to the host's existing dnsmasq.
+# Base URL only — the proxy appends /{Charge_Point_ID}, giving the charger's
+# original endpoint:  ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058
+#
+# A literal RFC1918 address, so the APN's total absence of DNS costs us nothing.
+# Plaintext ws:// on port 80: there is no TLS to Mobi.e, the private APN is the
+# security boundary. 10.200.10.0/24 collides with nothing on this network.
+central_system_url: "ws://10.200.10.200/ocpp/1.6"
+
+# Charge Point ID, used for the MQTT Last Will and Testament topic
+# (ocpp/{id}/availability). It must be configured here rather than taken from
+# the charger's connection, because the will has to be registered in the MQTT
+# CONNECT packet — before any charger has connected to tell us its ID.
+#
+# Without it there is no Last Will, and nothing tells Home Assistant when this
+# proxy dies unexpectedly. That is the only signal it gets: no orchestrator is
+# watching this process.
+charge_point_id: "MOBI-ALM-00058"
+
+# Not needed now that the Central System is a fixed private address: egress is
+# selected by a destination route for 10.200.10.0/24 in both the container and
+# the host, which is simpler than policy rules in two places. Kept available as
+# optional belt-and-braces if Mobi.e ever moves to a name or a wider range.
+# upstream_bind_address: "10.80.0.2"
+
+# --- Charger-facing listener ----------------------------------------------
+# The charger is on the isolated IoT network (192.168.51.0/24), reached through
+# the TL-WPA4220 powerline AP whose uplink now terminates on the spare BD4.
+# It reaches the proxy at this vmbr1 address via the spare router's existing
+# static route 192.168.52.0/24 via 192.168.51.10 — the same path Home Assistant
+# and Frigate already use. The isolation DROP rule does not match this
+# destination, so it needs no exception.
+# 0.0.0.0, deliberately, because the charger's network moved.
+#
+# The powerline AP's uplink is on the main router rather than the spare BD4, so
+# the charger lands on 192.168.50.x — and it is a general home AP, carrying
+# phones as well as the charger, which is why putting it behind the IoT
+# isolation would be wrong. Binding all legs means the charger is served
+# whichever network it is on, and moving the powerline to the IoT side later
+# needs no change here.
+#
+# The listener is reachable on 192.168.50.28 (main LAN), 192.168.52.30 (IoT
+# path) and 10.80.0.2 (a point-to-point /30 to the host only). Restricting it
+# is the Proxmox firewall's job — see the deployment runbook, and note that the
+# datacenter firewall is currently disabled.
+listen_address: "0.0.0.0"
+listen_port: 9000
+
+health_port: 8080
+
+# --- MQTT ------------------------------------------------------------------
+# Mosquitto runs as a Home Assistant add-on on VM 110, one LAN hop away.
+# TLS is optional and omitted here: the previous mutual-TLS requirement existed
+# because the broker was to be reached across the internet from AWS. It is not.
+# To enable TLS later, set ca_cert_path (server-auth) and optionally
+# client_cert_path + client_key_path (mutual).
+mqtt:
+  host: "192.168.50.167"
+  port: 1883
+  # username / password come from secrets.env
+
+logging:
+  level: INFO
+
+buffers:
+  message_buffer_size: 100
+  mqtt_buffer_size: 500
+  max_backoff_seconds: 60

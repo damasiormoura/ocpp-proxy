@@ -1,0 +1,51 @@
+[Unit]
+Description=OCPP 1.6J proxy — Autel charger to Mobi.e, with MQTT for Home Assistant
+Documentation=https://github.com/damasiormoura/ocpp-proxy
+After=network-online.target ocpp-routes.service
+Wants=network-online.target ocpp-routes.service
+
+# Wants, not Requires. If the routes fail the proxy still starts, reports
+# itself unhealthy and publishes that over MQTT, which is a louder signal than
+# a systemd unit sitting inactive with nobody watching it. It also keeps the
+# charger's connection being accepted, so the failure is visible where it
+# happens rather than as a refused connection.
+
+[Service]
+Type=simple
+User=ocpp
+Group=ocpp
+
+# MQTT credentials only. Everything else lives in /etc/ocpp-proxy/config.yaml.
+# Mode 600, owned root:ocpp — no secret belongs in the YAML or in git.
+EnvironmentFile=/etc/ocpp-proxy/secrets.env
+Environment=CONFIG_FILE_PATH=/etc/ocpp-proxy/config.yaml
+
+ExecStart=/usr/local/bin/ocpp-proxy
+
+# Nothing else watches this process — no orchestrator, no load balancer health
+# check. systemd is the whole recovery story, so it must never give up.
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=0
+
+# SIGTERM then 15s: the proxy budgets 10s to drain in-flight messages and 5s
+# for close acknowledgements. Anything longer is a hang worth killing.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ocpp-proxy
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ocpp-proxy
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

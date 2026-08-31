@@ -17,8 +17,14 @@ use crate::state::{ConnectionStateManager, HealthStatus};
 
 /// Shared state accessible by the health check handler.
 pub struct HealthState {
-    /// Connection state manager holding upstream/downstream/MQTT states and metrics.
-    pub connection_manager: Mutex<ConnectionStateManager>,
+    /// The live connection state manager, shared with the forwarding path.
+    ///
+    /// This must be the *same* `Arc` the session tasks and the downstream
+    /// server update. An earlier revision gave the health server its own
+    /// instance that nothing ever wrote to, so `/health` reported
+    /// `downstream: disconnected` and zero counters forever, and returned 503
+    /// permanently.
+    pub connection_manager: Arc<Mutex<ConnectionStateManager>>,
     /// Instant when the proxy started, used to compute uptime.
     pub start_time: Instant,
 }
@@ -30,6 +36,8 @@ pub struct HealthResponse {
     pub upstream: ConnectionState,
     pub downstream: ConnectionState,
     pub mqtt: ConnectionState,
+    /// Whether the charger-facing listener is bound and accepting connections.
+    pub listening: bool,
     pub uptime_seconds: u64,
     pub messages: MessageCounters,
 }
@@ -71,6 +79,7 @@ async fn health_handler(State(state): State<Arc<HealthState>>) -> impl IntoRespo
             upstream: manager.upstream_state(),
             downstream: manager.downstream_state(),
             mqtt: manager.mqtt_state(),
+            listening: manager.listener_bound(),
             uptime_seconds: uptime,
             messages: MessageCounters {
                 charger_to_central_forwarded: metrics.charger_to_central_forwarded,
@@ -81,8 +90,11 @@ async fn health_handler(State(state): State<Arc<HealthState>>) -> impl IntoRespo
         }
     };
 
+    // Idle is 200 on purpose: no charger connected is the resting state, not a
+    // fault, and returning 503 for it would make any restart-on-failure
+    // supervisor kill the proxy whenever nobody is charging.
     let http_status = match response.status {
-        HealthStatus::Healthy | HealthStatus::Degraded => StatusCode::OK,
+        HealthStatus::Healthy | HealthStatus::Idle | HealthStatus::Degraded => StatusCode::OK,
         HealthStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
     };
 
@@ -94,11 +106,21 @@ async fn health_handler(State(state): State<Arc<HealthState>>) -> impl IntoRespo
 /// This function spawns the server and blocks until it is shut down.
 /// It is intended to be run as a Tokio task.
 pub async fn run_health_server(port: u16, state: Arc<HealthState>) -> Result<(), std::io::Error> {
-    let app = health_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+    serve_health(listener, state).await
+}
+
+/// Serve the health endpoint on an already-bound listener.
+///
+/// Binding separately lets `main` report a bind failure at startup, where an
+/// operator will see it, rather than from inside a spawned task after the
+/// proxy has already announced itself as ready.
+pub async fn serve_health(
+    listener: tokio::net::TcpListener,
+    state: Arc<HealthState>,
+) -> Result<(), std::io::Error> {
+    axum::serve(listener, health_router(state)).await
 }
 
 #[cfg(test)]
@@ -114,7 +136,7 @@ mod tests {
     /// Helper to create a shared HealthState for testing.
     fn make_health_state() -> Arc<HealthState> {
         Arc::new(HealthState {
-            connection_manager: Mutex::new(ConnectionStateManager::new(16)),
+            connection_manager: Arc::new(Mutex::new(ConnectionStateManager::new(16))),
             start_time: Instant::now(),
         })
     }
@@ -125,7 +147,12 @@ mod tests {
         let app = health_router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -146,6 +173,7 @@ mod tests {
 
         {
             let mut mgr = state.connection_manager.lock().await;
+            mgr.set_listener_bound(true);
             mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
             mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
             mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
@@ -154,7 +182,12 @@ mod tests {
         let app = health_router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -175,6 +208,7 @@ mod tests {
 
         {
             let mut mgr = state.connection_manager.lock().await;
+            mgr.set_listener_bound(true);
             mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
             mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
             // MQTT stays Disconnected
@@ -183,7 +217,12 @@ mod tests {
         let app = health_router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -209,7 +248,12 @@ mod tests {
         let app = health_router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -227,7 +271,12 @@ mod tests {
         let app = health_router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -253,7 +302,12 @@ mod tests {
         let app = health_router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -273,7 +327,12 @@ mod tests {
         let app = health_router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -293,6 +352,7 @@ mod tests {
             upstream: ConnectionState::Connected,
             downstream: ConnectionState::Connected,
             mqtt: ConnectionState::Connected,
+            listening: true,
             uptime_seconds: 120,
             messages: MessageCounters {
                 charger_to_central_forwarded: 10,
@@ -327,7 +387,12 @@ mod tests {
         let app = health_router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

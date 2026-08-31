@@ -3,6 +3,7 @@
 //! Supports layered configuration: environment variables take precedence over YAML file values.
 //! Environment variables use the prefix `OCPP_PROXY_` with `__` as the nested separator.
 
+use std::net::IpAddr;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -34,6 +35,10 @@ fn default_health_port() -> u16 {
     8080
 }
 
+fn default_listen_address() -> IpAddr {
+    IpAddr::from([0, 0, 0, 0])
+}
+
 fn default_log_level() -> LogLevel {
     LogLevel::Info
 }
@@ -55,6 +60,27 @@ fn default_max_backoff() -> u64 {
 pub struct ProxyConfig {
     pub central_system_url: String,
     pub listen_port: u16,
+    /// Charger-facing bind address. Defaults to all interfaces.
+    ///
+    /// In the LXC deployment this is the `vmbr1` address, so the listener is
+    /// never exposed on the WWAN-egress leg or the main LAN.
+    #[serde(default = "default_listen_address")]
+    pub listen_address: IpAddr,
+    /// Local source address for the upstream socket.
+    ///
+    /// Not needed when the Central System is reached by a destination route,
+    /// which is the case for the Mobi.e APN. Retained for a deployment where
+    /// egress must be selected by source address instead.
+    #[serde(default)]
+    pub upstream_bind_address: Option<IpAddr>,
+    /// Charge Point ID used for the MQTT Last Will and Testament topic.
+    ///
+    /// The LWT must be registered before the broker connection is opened, so
+    /// it cannot be derived from a charger connection that has not happened
+    /// yet. Per-message and status topics use the ID from the live connection;
+    /// only the availability topic depends on this.
+    #[serde(default)]
+    pub charge_point_id: Option<String>,
     #[serde(default = "default_health_port")]
     pub health_port: u16,
     pub mqtt: MqttConfig,
@@ -71,9 +97,27 @@ pub struct MqttConfig {
     pub port: u16,
     pub username: String,
     pub password: String,
-    pub ca_cert_path: String,
-    pub client_cert_path: String,
-    pub client_key_path: String,
+    /// TLS is optional: the broker is one LAN hop away, not across the
+    /// internet. All three absent means plaintext; `ca_cert_path` alone means
+    /// server-authenticated TLS; all three means mutual TLS.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_key_path: Option<String>,
+}
+
+impl MqttConfig {
+    /// Whether TLS should be used for the broker connection.
+    pub fn tls_enabled(&self) -> bool {
+        self.ca_cert_path.is_some()
+    }
+
+    /// Whether a client certificate and key are both configured.
+    pub fn client_auth_enabled(&self) -> bool {
+        self.client_cert_path.is_some() && self.client_key_path.is_some()
+    }
 }
 
 /// Logging configuration.
@@ -112,6 +156,68 @@ impl Default for BufferConfig {
     }
 }
 
+/// All-optional mirror of the required parts of [`ProxyConfig`].
+///
+/// Exists only so that every missing required parameter can be reported at
+/// once, rather than serde stopping at the first one.
+#[derive(Debug, Deserialize)]
+struct RawProxyConfig {
+    central_system_url: Option<String>,
+    listen_port: Option<u16>,
+    mqtt: Option<RawMqttConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMqttConfig {
+    host: Option<String>,
+    port: Option<u16>,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl RawProxyConfig {
+    /// Names of every required parameter that is absent.
+    ///
+    /// TLS certificate paths are deliberately absent from this list: they are
+    /// optional, because the broker is reached over one local hop rather than
+    /// across the internet.
+    fn missing_required(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+
+        if self.central_system_url.is_none() {
+            missing.push("central_system_url");
+        }
+        if self.listen_port.is_none() {
+            missing.push("listen_port");
+        }
+
+        match &self.mqtt {
+            None => missing.extend_from_slice(&[
+                "mqtt.host",
+                "mqtt.port",
+                "mqtt.username",
+                "mqtt.password",
+            ]),
+            Some(mqtt) => {
+                if mqtt.host.is_none() {
+                    missing.push("mqtt.host");
+                }
+                if mqtt.port.is_none() {
+                    missing.push("mqtt.port");
+                }
+                if mqtt.username.is_none() {
+                    missing.push("mqtt.username");
+                }
+                if mqtt.password.is_none() {
+                    missing.push("mqtt.password");
+                }
+            }
+        }
+
+        missing
+    }
+}
+
 impl ProxyConfig {
     /// Load configuration from environment variables and YAML file.
     ///
@@ -119,8 +225,8 @@ impl ProxyConfig {
     /// 1. Environment variables prefixed with `OCPP_PROXY_` (nested via `__`)
     /// 2. YAML file at `CONFIG_FILE_PATH` env var or `./config.yaml`
     pub fn load() -> Result<Self, ProxyError> {
-        let config_path = std::env::var("CONFIG_FILE_PATH")
-            .unwrap_or_else(|_| "./config.yaml".to_string());
+        let config_path =
+            std::env::var("CONFIG_FILE_PATH").unwrap_or_else(|_| "./config.yaml".to_string());
         Self::load_from_path(&config_path)
     }
 
@@ -147,6 +253,29 @@ impl ProxyConfig {
             description: format!("Failed to load configuration: {}", e),
         })?;
 
+        // Requirement 7.3 — report EVERY missing parameter in one error.
+        //
+        // Deserialising straight into `ProxyConfig` cannot do this: serde
+        // fails on the first absent field, so an operator missing four
+        // settings has to restart four times to discover them all. Passing
+        // through an all-optional shadow struct first lets us collect them.
+        if let Ok(raw) = settings.clone().try_deserialize::<RawProxyConfig>() {
+            let missing = raw.missing_required();
+            if !missing.is_empty() {
+                return Err(ProxyError::Config {
+                    description: format!(
+                        "Missing required configuration parameter{}:\n{}",
+                        if missing.len() == 1 { "" } else { "s" },
+                        missing
+                            .iter()
+                            .map(|m| format!("  - {}", m))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                });
+            }
+        }
+
         let proxy_config: ProxyConfig =
             settings.try_deserialize().map_err(|e| ProxyError::Config {
                 description: format!("Failed to deserialize configuration: {}", e),
@@ -155,10 +284,7 @@ impl ProxyConfig {
         let errors = proxy_config.validate();
         if !errors.is_empty() {
             return Err(ProxyError::Config {
-                description: format!(
-                    "Configuration validation failed:\n{}",
-                    errors.join("\n")
-                ),
+                description: format!("Configuration validation failed:\n{}", errors.join("\n")),
             });
         }
 
@@ -172,14 +298,27 @@ impl ProxyConfig {
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
-        // Validate listen_port is not 0
-        if self.listen_port == 0 {
-            errors.push("listen_port must be between 1 and 65535".to_string());
+        // Requirement 1.1 constrains the charger port to the unprivileged range;
+        // the proxy runs as a non-root service and cannot bind below 1024.
+        if self.listen_port < 1024 {
+            errors.push(format!(
+                "listen_port must be between 1024 and 65535, got: {}",
+                self.listen_port
+            ));
         }
 
-        // Validate health_port is not 0
-        if self.health_port == 0 {
-            errors.push("health_port must be between 1 and 65535".to_string());
+        if self.health_port < 1024 {
+            errors.push(format!(
+                "health_port must be between 1024 and 65535, got: {}",
+                self.health_port
+            ));
+        }
+
+        if self.listen_port == self.health_port {
+            errors.push(format!(
+                "listen_port and health_port must differ, both are: {}",
+                self.listen_port
+            ));
         }
 
         // Validate central_system_url scheme
@@ -197,24 +336,32 @@ impl ProxyConfig {
             errors.push("mqtt.port must be between 1 and 65535".to_string());
         }
 
-        // Validate TLS certificate paths exist
-        if !Path::new(&self.mqtt.ca_cert_path).exists() {
-            errors.push(format!(
-                "mqtt.ca_cert_path does not exist: {}",
-                self.mqtt.ca_cert_path
-            ));
+        // TLS certificate paths are optional, but any path that IS given must
+        // point at a readable file — existence alone is not enough, since the
+        // service runs as an unprivileged user that may not be able to read it.
+        for (name, path) in [
+            ("mqtt.ca_cert_path", self.mqtt.ca_cert_path.as_ref()),
+            ("mqtt.client_cert_path", self.mqtt.client_cert_path.as_ref()),
+            ("mqtt.client_key_path", self.mqtt.client_key_path.as_ref()),
+        ] {
+            if let Some(path) = path {
+                if !Path::new(path).exists() {
+                    errors.push(format!("{} does not exist: {}", name, path));
+                } else if std::fs::File::open(path).is_err() {
+                    errors.push(format!("{} exists but is not readable: {}", name, path));
+                }
+            }
         }
-        if !Path::new(&self.mqtt.client_cert_path).exists() {
-            errors.push(format!(
-                "mqtt.client_cert_path does not exist: {}",
-                self.mqtt.client_cert_path
-            ));
+
+        // A client certificate without its key (or the reverse) would silently
+        // downgrade to server-authenticated TLS. Fail instead of degrading.
+        if self.mqtt.client_cert_path.is_some() != self.mqtt.client_key_path.is_some() {
+            errors.push(
+                "mqtt.client_cert_path and mqtt.client_key_path must be set together".to_string(),
+            );
         }
-        if !Path::new(&self.mqtt.client_key_path).exists() {
-            errors.push(format!(
-                "mqtt.client_key_path does not exist: {}",
-                self.mqtt.client_key_path
-            ));
+        if !self.mqtt.tls_enabled() && self.mqtt.client_auth_enabled() {
+            errors.push("mqtt client certificates require mqtt.ca_cert_path to be set".to_string());
         }
 
         errors
@@ -228,23 +375,22 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /// Helper to create a valid ProxyConfig for testing.
-    fn valid_config(
-        ca_path: &str,
-        cert_path: &str,
-        key_path: &str,
-    ) -> ProxyConfig {
+    fn valid_config(ca_path: &str, cert_path: &str, key_path: &str) -> ProxyConfig {
         ProxyConfig {
             central_system_url: "wss://mobi-e.example.com/ocpp".to_string(),
             listen_port: 9000,
+            listen_address: default_listen_address(),
+            upstream_bind_address: None,
+            charge_point_id: None,
             health_port: 8080,
             mqtt: MqttConfig {
                 host: "mqtt.example.com".to_string(),
                 port: 8883,
                 username: "user".to_string(),
                 password: "pass".to_string(),
-                ca_cert_path: ca_path.to_string(),
-                client_cert_path: cert_path.to_string(),
-                client_key_path: key_path.to_string(),
+                ca_cert_path: Some(ca_path.to_string()),
+                client_cert_path: Some(cert_path.to_string()),
+                client_key_path: Some(key_path.to_string()),
             },
             logging: LogConfig {
                 level: LogLevel::Info,
@@ -405,22 +551,29 @@ mod tests {
         let config = ProxyConfig {
             central_system_url: "http://bad.com".to_string(),
             listen_port: 0,
+            listen_address: default_listen_address(),
+            upstream_bind_address: None,
+            charge_point_id: None,
             health_port: 0,
             mqtt: MqttConfig {
                 host: "localhost".to_string(),
                 port: 0,
                 username: "user".to_string(),
                 password: "pass".to_string(),
-                ca_cert_path: "/nonexistent/ca.pem".to_string(),
-                client_cert_path: "/nonexistent/cert.pem".to_string(),
-                client_key_path: "/nonexistent/key.pem".to_string(),
+                ca_cert_path: Some("/nonexistent/ca.pem".to_string()),
+                client_cert_path: Some("/nonexistent/cert.pem".to_string()),
+                client_key_path: Some("/nonexistent/key.pem".to_string()),
             },
             logging: LogConfig::default(),
             buffers: BufferConfig::default(),
         };
         let errors = config.validate();
         // Should report all errors, not just the first
-        assert!(errors.len() >= 5, "Expected at least 5 errors, got: {:?}", errors);
+        assert!(
+            errors.len() >= 5,
+            "Expected at least 5 errors, got: {:?}",
+            errors
+        );
         assert!(errors.iter().any(|e| e.contains("listen_port")));
         assert!(errors.iter().any(|e| e.contains("health_port")));
         assert!(errors.iter().any(|e| e.contains("central_system_url")));

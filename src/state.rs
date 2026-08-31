@@ -13,8 +13,21 @@ use crate::models::{ConnectionId, ConnectionState, StateChange};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
+    /// Charger connected, upstream established, MQTT connected. HTTP 200.
     Healthy,
+    /// Listening, but no charger connected. HTTP 200.
+    ///
+    /// This is the normal state whenever no vehicle is plugged in and is
+    /// explicitly *not* a fault. An earlier revision reported it as
+    /// `Unhealthy`/503, which combined with a restart-on-failed-healthcheck
+    /// supervisor would have restarted the proxy forever whenever nobody was
+    /// charging.
+    Idle,
+    /// Forwarding impaired but recoverable: upstream reconnecting inside its
+    /// window, or MQTT down. HTTP 200.
     Degraded,
+    /// Not listening, or a charger is connected and upstream has failed past
+    /// its reconnection window. HTTP 503.
     Unhealthy,
 }
 
@@ -34,6 +47,11 @@ pub struct ConnectionStateManager {
     upstream_state: ConnectionState,
     downstream_state: ConnectionState,
     mqtt_state: ConnectionState,
+    /// Whether the charger-facing listener is bound and accepting.
+    ///
+    /// Distinguishes "idle, waiting for a charger" from "cannot serve at all",
+    /// which the connection states alone cannot express.
+    listener_bound: bool,
     state_tx: broadcast::Sender<StateChange>,
     metrics: ConnectionMetrics,
 }
@@ -49,6 +67,7 @@ impl ConnectionStateManager {
             upstream_state: ConnectionState::Disconnected,
             downstream_state: ConnectionState::Disconnected,
             mqtt_state: ConnectionState::Disconnected,
+            listener_bound: false,
             state_tx,
             metrics: ConnectionMetrics::default(),
         }
@@ -84,29 +103,48 @@ impl ConnectionStateManager {
         let _ = self.state_tx.send(event);
     }
 
+    /// Mark the charger-facing listener as bound or unbound.
+    pub fn set_listener_bound(&mut self, bound: bool) {
+        self.listener_bound = bound;
+    }
+
+    /// Whether the charger-facing listener is bound.
+    pub fn listener_bound(&self) -> bool {
+        self.listener_bound
+    }
+
     /// Compute the overall proxy health status.
     ///
-    /// Health rules (evaluated in order):
-    /// 1. If downstream is disconnected → Unhealthy
-    /// 2. If upstream AND downstream are connected, MQTT is disconnected → Degraded
-    /// 3. If upstream AND downstream are connected → Healthy
-    /// 4. Otherwise → Unhealthy
+    /// Health describes the proxy's ability to serve, not whether a charger
+    /// happens to be plugged in. Rules, in order:
+    ///
+    /// 1. Listener not bound → `Unhealthy` (503) — we cannot serve at all
+    /// 2. No charger connected → `Idle` (200) — the normal resting state
+    /// 3. Charger connected, upstream up, MQTT up → `Healthy` (200)
+    /// 4. Charger connected, upstream up, MQTT down → `Degraded` (200) — MQTT
+    ///    loss costs Home Assistant visibility but never costs charging
+    /// 5. Charger connected, upstream reconnecting → `Degraded` (200)
+    /// 6. Charger connected, upstream down → `Unhealthy` (503)
     pub fn health_status(&self) -> HealthStatus {
-        if self.downstream_state == ConnectionState::Disconnected {
+        if !self.listener_bound {
             return HealthStatus::Unhealthy;
         }
 
-        let upstream_connected = self.upstream_state == ConnectionState::Connected;
-        let downstream_connected = self.downstream_state == ConnectionState::Connected;
-
-        if upstream_connected && downstream_connected {
-            if self.mqtt_state == ConnectionState::Disconnected {
-                return HealthStatus::Degraded;
-            }
-            return HealthStatus::Healthy;
+        if self.downstream_state != ConnectionState::Connected {
+            return HealthStatus::Idle;
         }
 
-        HealthStatus::Unhealthy
+        match self.upstream_state {
+            ConnectionState::Connected => {
+                if self.mqtt_state == ConnectionState::Connected {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Degraded
+                }
+            }
+            ConnectionState::Connecting | ConnectionState::Reconnecting => HealthStatus::Degraded,
+            ConnectionState::Disconnected => HealthStatus::Unhealthy,
+        }
     }
 
     /// Subscribe to state change notifications.
@@ -124,6 +162,30 @@ impl ConnectionStateManager {
     /// Get a mutable reference to the connection metrics.
     pub fn metrics_mut(&mut self) -> &mut ConnectionMetrics {
         &mut self.metrics
+    }
+
+    /// Record a successfully forwarded message.
+    pub fn record_forwarded(&mut self, direction: crate::models::Direction) {
+        match direction {
+            crate::models::Direction::ChargerToCentral => {
+                self.metrics.charger_to_central_forwarded += 1
+            }
+            crate::models::Direction::CentralToCharger => {
+                self.metrics.central_to_charger_forwarded += 1
+            }
+        }
+    }
+
+    /// Record a dropped message.
+    pub fn record_dropped(&mut self, direction: crate::models::Direction, count: u64) {
+        match direction {
+            crate::models::Direction::ChargerToCentral => {
+                self.metrics.charger_to_central_dropped += count
+            }
+            crate::models::Direction::CentralToCharger => {
+                self.metrics.central_to_charger_dropped += count
+            }
+        }
     }
 
     /// Get the current upstream connection state.
@@ -152,104 +214,144 @@ mod tests {
 
     // --- Health status tests covering all key combinations ---
 
+    /// Health describes the proxy's ability to serve, not whether a charger
+    /// happens to be plugged in. These cases pin that distinction down.
+
     #[test]
-    fn test_health_all_disconnected_is_unhealthy() {
+    fn test_listener_unbound_is_unhealthy() {
         let mgr = make_manager();
+        assert!(!mgr.listener_bound());
         assert_eq!(mgr.health_status(), HealthStatus::Unhealthy);
     }
 
+    /// The regression this revision exists to prevent.
+    ///
+    /// "Listening, no charger connected" is the normal resting state whenever
+    /// no vehicle is plugged in. Reporting it as unhealthy — as the previous
+    /// implementation did — makes any restart-on-failed-healthcheck supervisor
+    /// restart the proxy forever whenever nobody is charging.
     #[test]
-    fn test_health_downstream_disconnected_always_unhealthy() {
+    fn test_listening_with_no_charger_is_idle_not_unhealthy() {
         let mut mgr = make_manager();
-        // Upstream connected, MQTT connected, but downstream disconnected
-        mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
-        assert_eq!(mgr.health_status(), HealthStatus::Unhealthy);
+        mgr.set_listener_bound(true);
+        assert_eq!(mgr.health_status(), HealthStatus::Idle);
+        assert_ne!(mgr.health_status(), HealthStatus::Unhealthy);
     }
 
     #[test]
-    fn test_health_upstream_and_downstream_connected_mqtt_connected_is_healthy() {
+    fn test_idle_regardless_of_upstream_and_mqtt_when_no_charger() {
+        for upstream in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Connected,
+            ConnectionState::Reconnecting,
+        ] {
+            for mqtt in [ConnectionState::Disconnected, ConnectionState::Connected] {
+                let mut mgr = make_manager();
+                mgr.set_listener_bound(true);
+                mgr.transition(ConnectionId::Upstream, upstream);
+                mgr.transition(ConnectionId::Mqtt, mqtt);
+                assert_eq!(
+                    mgr.health_status(),
+                    HealthStatus::Idle,
+                    "no charger connected must be idle (upstream={:?}, mqtt={:?})",
+                    upstream,
+                    mqtt
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_charger_and_upstream_connected_with_mqtt_is_healthy() {
         let mut mgr = make_manager();
+        mgr.set_listener_bound(true);
         mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
         mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
         mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
         assert_eq!(mgr.health_status(), HealthStatus::Healthy);
     }
 
+    /// MQTT loss costs Home Assistant visibility, never charging. Degraded,
+    /// and deliberately still HTTP 200.
     #[test]
-    fn test_health_upstream_and_downstream_connected_mqtt_disconnected_is_degraded() {
-        let mut mgr = make_manager();
-        mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
-        // MQTT stays Disconnected (default)
-        assert_eq!(mgr.health_status(), HealthStatus::Degraded);
+    fn test_mqtt_not_connected_is_degraded() {
+        for mqtt in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Reconnecting,
+        ] {
+            let mut mgr = make_manager();
+            mgr.set_listener_bound(true);
+            mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
+            mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
+            mgr.transition(ConnectionId::Mqtt, mqtt);
+            assert_eq!(
+                mgr.health_status(),
+                HealthStatus::Degraded,
+                "mqtt={:?} should be degraded",
+                mqtt
+            );
+        }
     }
 
     #[test]
-    fn test_health_upstream_and_downstream_connected_mqtt_reconnecting_is_healthy() {
-        let mut mgr = make_manager();
-        mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Mqtt, ConnectionState::Reconnecting);
-        assert_eq!(mgr.health_status(), HealthStatus::Healthy);
+    fn test_upstream_reconnecting_with_charger_is_degraded() {
+        for upstream in [ConnectionState::Connecting, ConnectionState::Reconnecting] {
+            let mut mgr = make_manager();
+            mgr.set_listener_bound(true);
+            mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
+            mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
+            mgr.transition(ConnectionId::Upstream, upstream);
+            assert_eq!(mgr.health_status(), HealthStatus::Degraded);
+        }
     }
 
+    /// A charger that is connected but cannot reach Mobi.e is the one runtime
+    /// state that genuinely warrants 503: charging and billing are broken.
     #[test]
-    fn test_health_upstream_and_downstream_connected_mqtt_connecting_is_healthy() {
+    fn test_charger_connected_upstream_down_is_unhealthy() {
         let mut mgr = make_manager();
-        mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
+        mgr.set_listener_bound(true);
         mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Mqtt, ConnectionState::Connecting);
-        assert_eq!(mgr.health_status(), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_upstream_disconnected_downstream_connected_is_unhealthy() {
-        let mut mgr = make_manager();
-        mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
-        // Upstream stays Disconnected (default)
-        assert_eq!(mgr.health_status(), HealthStatus::Unhealthy);
-    }
-
-    #[test]
-    fn test_health_upstream_reconnecting_downstream_connected_is_unhealthy() {
-        let mut mgr = make_manager();
-        mgr.transition(ConnectionId::Upstream, ConnectionState::Reconnecting);
-        mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
-        assert_eq!(mgr.health_status(), HealthStatus::Unhealthy);
-    }
-
-    #[test]
-    fn test_health_upstream_connecting_downstream_connected_is_unhealthy() {
-        let mut mgr = make_manager();
-        mgr.transition(ConnectionId::Upstream, ConnectionState::Connecting);
-        mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
+        mgr.transition(ConnectionId::Upstream, ConnectionState::Disconnected);
         mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
         assert_eq!(mgr.health_status(), HealthStatus::Unhealthy);
     }
 
+    /// Exhaustive: while listening, the ONLY route to 503 is a connected
+    /// charger with a dead upstream.
     #[test]
-    fn test_health_downstream_reconnecting_is_unhealthy() {
-        let mut mgr = make_manager();
-        mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Downstream, ConnectionState::Reconnecting);
-        mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
-        // Downstream is not Disconnected, but it's also not Connected.
-        // The health rules: downstream disconnected → unhealthy (not this case);
-        // upstream AND downstream connected → healthy/degraded (downstream not connected here).
-        // Else → unhealthy.
-        assert_eq!(mgr.health_status(), HealthStatus::Unhealthy);
-    }
+    fn test_no_unexpected_unhealthy_while_listening() {
+        let states = [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Connected,
+            ConnectionState::Reconnecting,
+        ];
+        for up in states {
+            for down in states {
+                for mqtt in states {
+                    let mut mgr = make_manager();
+                    mgr.set_listener_bound(true);
+                    mgr.transition(ConnectionId::Upstream, up);
+                    mgr.transition(ConnectionId::Downstream, down);
+                    mgr.transition(ConnectionId::Mqtt, mqtt);
 
-    #[test]
-    fn test_health_downstream_connecting_is_unhealthy() {
-        let mut mgr = make_manager();
-        mgr.transition(ConnectionId::Upstream, ConnectionState::Connected);
-        mgr.transition(ConnectionId::Downstream, ConnectionState::Connecting);
-        mgr.transition(ConnectionId::Mqtt, ConnectionState::Connected);
-        assert_eq!(mgr.health_status(), HealthStatus::Unhealthy);
+                    let expected_unhealthy =
+                        down == ConnectionState::Connected && up == ConnectionState::Disconnected;
+                    assert_eq!(
+                        mgr.health_status() == HealthStatus::Unhealthy,
+                        expected_unhealthy,
+                        "unexpected health for up={:?} down={:?} mqtt={:?} -> {:?}",
+                        up,
+                        down,
+                        mqtt,
+                        mgr.health_status()
+                    );
+                }
+            }
+        }
     }
 
     // --- Transition and broadcast tests ---
