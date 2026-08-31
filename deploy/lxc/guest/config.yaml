@@ -7,19 +7,19 @@
 # point, and whether its hostname resolves through public DNS or only through
 # the APN's resolvers. If only through the APN, add a domain-specific
 # "server=/<zone>/<apn-dns>" entry to the host's existing dnsmasq.
-# NOTE: the APN provides no DNS (measured — the dongle offers no DNS server,
-# does not proxy port 53, and public resolvers are unreachable over it). The
-# hostname below is resolved by the LXC's LAN resolver while the socket itself
-# egresses over the APN. If the name does not resolve publicly, or resolves to
-# an address unreachable inside the APN, configure it by IP instead.
-central_system_url: "wss://__MOBIE_HOST__/ocpp/v16"
+# Base URL only — the proxy appends /{Charge_Point_ID}, giving the charger's
+# original endpoint:  ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058
+#
+# A literal RFC1918 address, so the APN's total absence of DNS costs us nothing.
+# Plaintext ws:// on port 80: there is no TLS to Mobi.e, the private APN is the
+# security boundary. 10.200.10.0/24 collides with nothing on this network.
+central_system_url: "ws://10.200.10.200/ocpp/1.6"
 
-# Source address for the upstream socket. The host's policy rule
-# ("ip rule add from 10.80.0.2 lookup 100") keys on exactly this address to
-# send Mobi.e traffic out wwan0. Changing it here without changing the host
-# rule sends Mobi.e traffic over the LAN default route instead — where it
-# cannot reach the APN-only endpoint.
-upstream_bind_address: "10.80.0.2"
+# Not needed now that the Central System is a fixed private address: egress is
+# selected by a destination route for 10.200.10.0/24 in both the container and
+# the host, which is simpler than policy rules in two places. Kept available as
+# optional belt-and-braces if Mobi.e ever moves to a name or a wider range.
+# upstream_bind_address: "10.80.0.2"
 
 # --- Charger-facing listener ----------------------------------------------
 # The charger is on the isolated IoT network (192.168.51.0/24), reached through

@@ -4,26 +4,28 @@ Before=ocpp-proxy.service
 After=network-online.target
 Wants=network-online.target
 
-# Why this exists — the non-obvious half of the egress design.
+# Why this exists.
 #
-# Binding the upstream socket to 10.80.0.2 sets the SOURCE address. It does not
-# choose a ROUTE. Without the rule below, the kernel looks up the Mobi.e
-# destination in the main table, matches the default route via 192.168.50.1,
-# and hands the main router a packet sourced from 10.80.0.2 — an address it has
-# never heard of. The connection dies, and it dies in a way that looks like
-# Mobi.e being unreachable rather than a routing mistake.
+# The Central System is ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058 — a fixed
+# RFC1918 address reachable only inside the APN. Without the route below, the
+# container matches its LAN default route and sends Mobi.e traffic to the main
+# router, which cannot reach 10.200.10.0/24. The symptom is "Mobi.e
+# unreachable", which reads as an upstream fault rather than a routing mistake.
 #
-# So the policy rule is needed in BOTH places: here, so the container sends the
-# packet to the host across vmbr2; and on the host, so the host forwards it out
-# wwan0 instead of back to the LAN.
+# The route is needed in BOTH places: here, so the container hands the packet
+# to the host across vmbr2, and on the host, so the host forwards it out wwan0
+# instead of back to the LAN.
+#
+# A destination route rather than a source-address policy rule, because the
+# endpoint is a fixed private range. That keeps the app out of it entirely —
+# no bind-address configuration, and nothing to keep in sync between the two
+# halves except one prefix.
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/sbin/ip route replace default via 10.80.0.1 dev eth1 table 100
-ExecStart=/bin/sh -c 'ip rule show | grep -q "from 10.80.0.2 lookup 100" || ip rule add from 10.80.0.2 lookup 100 priority 100'
-ExecStop=/bin/sh -c 'ip rule del from 10.80.0.2 lookup 100 priority 100 2>/dev/null || true'
-ExecStop=/bin/sh -c 'ip route flush table 100 2>/dev/null || true'
+ExecStart=/sbin/ip route replace 10.200.10.0/24 via 10.80.0.1 dev eth1
+ExecStop=/bin/sh -c 'ip route del 10.200.10.0/24 2>/dev/null || true'
 
 [Install]
 WantedBy=multi-user.target

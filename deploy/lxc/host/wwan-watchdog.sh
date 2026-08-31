@@ -16,13 +16,15 @@
 set -uo pipefail
 
 IFACE="wwan0"
-BIND_SRC="10.80.0.2"
+LXC_NET="10.80.0.0/30"
+MOBIE_NET="10.200.10.0/24"
 TABLE="100"
 LOG_TAG="ocpp-wwan"
 
 # Filled in from /etc/default/ocpp-wwan so this script carries no site values.
 WWAN_GW=""
 PROBE_HOST=""
+PROBE_PORT=""
 [ -r /etc/default/ocpp-wwan ] && . /etc/default/ocpp-wwan
 
 log() { logger -t "$LOG_TAG" -- "$*"; }
@@ -53,29 +55,32 @@ if ! ip route show table "$TABLE" 2>/dev/null | grep -q '^default'; then
     ip route replace default via "$WWAN_GW" dev "$IFACE" table "$TABLE" && repaired=1
 fi
 
-# 4. Policy rule steering the proxy's upstream socket into that table.
-if ! ip rule show | grep -q "from $BIND_SRC lookup $TABLE"; then
-    log "regra de policy routing de $BIND_SRC estava AUSENTE - reaplicando"
-    ip rule add from "$BIND_SRC" lookup "$TABLE" priority 100 && repaired=1
+# 4. Destination route for the Mobi.e range out of the dongle.
+if ! ip route show | grep -q "^$MOBIE_NET"; then
+    log "rota para $MOBIE_NET estava AUSENTE - reaplicando via $WWAN_GW"
+    ip route replace "$MOBIE_NET" via "$WWAN_GW" dev "$IFACE" && repaired=1
 fi
 
 # 5. NAT and MSS clamp.
-if ! iptables -t nat -C POSTROUTING -s 10.80.0.0/30 -o "$IFACE" -j MASQUERADE 2>/dev/null; then
+if ! iptables -t nat -C POSTROUTING -s "$LXC_NET" -o "$IFACE" -j MASQUERADE 2>/dev/null; then
     log "regra de MASQUERADE estava AUSENTE - reaplicando"
-    iptables -t nat -A POSTROUTING -s 10.80.0.0/30 -o "$IFACE" -j MASQUERADE && repaired=1
+    iptables -t nat -A POSTROUTING -s "$LXC_NET" -o "$IFACE" -j MASQUERADE && repaired=1
 fi
 if ! iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
     log "clamp de MSS estava AUSENTE - reaplicando"
     iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu && repaired=1
 fi
 
-# 6. End-to-end reachability through the APN, from the proxy's source address.
-#    Only meaningful once PROBE_HOST is set to the Mobi.e endpoint.
-if [ -n "$PROBE_HOST" ]; then
-    if ! ping -c 2 -W 5 -I "$BIND_SRC" "$PROBE_HOST" >/dev/null 2>&1; then
-        log "AVISO: $PROBE_HOST inalcancavel via $IFACE a partir de $BIND_SRC"
-        # Some APNs drop ICMP; a failure here is a warning, not a repair
-        # trigger. The proxy's own health endpoint is authoritative.
+# 6. End-to-end reachability through the APN.
+#
+#    TCP, not ICMP: this APN drops ping even when it is working, so a ping
+#    probe would report a permanent false failure. There is also no public
+#    host to probe — the APN is closed — so the target is Mobi.e itself.
+if [ -n "$PROBE_HOST" ] && [ -n "$PROBE_PORT" ]; then
+    if ! timeout 8 bash -c "</dev/tcp/$PROBE_HOST/$PROBE_PORT" 2>/dev/null; then
+        log "AVISO: $PROBE_HOST:$PROBE_PORT inalcancavel via $IFACE"
+        # A failure here is a warning, not a repair trigger — the link may be
+        # fine and Mobi.e down. The proxy health endpoint is authoritative.
     fi
 fi
 

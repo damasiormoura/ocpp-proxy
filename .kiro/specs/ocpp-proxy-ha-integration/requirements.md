@@ -228,7 +228,9 @@ The Proxy is therefore designed to fail *closed and loudly* — it must make its
 
 1. THE APN is a closed network. Generic internet egress is blocked: ICMP to `1.1.1.1` and TCP to public HTTP endpoints both fail while the modem reports a healthy connected session
 2. THE APN provides no usable DNS. The dongle offers no DNS server in its DHCP lease, does not proxy port 53 on its own gateway address, and public resolvers are unreachable over the path
-3. THE Proxy SHALL therefore resolve the Central_System hostname over the LAN resolver while connecting over the WWAN_Link. Name resolution and transport deliberately take different paths
-4. IF the Central_System hostname does not resolve publicly, or resolves to an address not reachable inside the APN, THEN the endpoint SHALL be configured by IP address and that fact SHALL be recorded, since no DNS is available on the mobile path to resolve it
-5. THE absence of generic internet egress SHALL NOT be treated as a fault. It is the expected behaviour of a private APN and confirms the SIM is provisioned for Mobi.e traffic only
-6. Reachability of the WWAN_Link SHALL be tested against the Central_System endpoint itself, not against a public host, because no public host is reachable
+3. THE Central_System endpoint is `ws://10.200.10.200/ocpp/1.6/{Charge_Point_ID}`, with Charge_Point_ID `MOBI-ALM-00058`. It is a literal RFC1918 address, so the absence of DNS on the mobile path costs nothing and no resolver configuration is required
+4. THE Central_System connection is plaintext `ws://` on port 80. The private APN is the entire security boundary between the Proxy and Mobi.e. This is the Charger's pre-existing arrangement and SHALL NOT be presented as introduced by this design; the Upstream_Connection consequently requires no TLS
+5. THE `10.200.10.0/24` range SHALL be routed over the WWAN_Link by destination route on both the Proxmox_Host and inside the Proxy_LXC. The range collides with no local network. This supersedes the source-address policy-routing scheme in Requirement 2 criterion 7, which is retained only as an optional measure should Mobi.e later move to a hostname or a wider range
+6. THE absence of generic internet egress SHALL NOT be treated as a fault. It is the expected behaviour of a private APN and confirms the SIM is provisioned for Mobi.e traffic only
+7. Reachability of the WWAN_Link SHALL be tested by TCP connection to `10.200.10.200:80`, not by ICMP and not against a public host. The APN drops ICMP even when working, and no public host is reachable
+8. THE Charger's original Mobi.e endpoint is now recorded in this document and in `deploy/lxc/guest/config.yaml`, satisfying the prerequisite for the manual bypass in Requirement 11 criterion 13

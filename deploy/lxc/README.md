@@ -42,7 +42,7 @@ config files:
 | Item | Status |
 |---|---|
 | Dongle subnet and gateway | **Resolved 2026-08-31.** `192.168.0.0/24`, gateway `192.168.0.1`, DHCP offers `.169`. Modem reports LTE, full signal, `ppp_connected`, operator NOS. Confirm the DHCP pool range in the dongle UI and move the static address outside it if `.169` falls inside. |
-| `__MOBIE_HOST__` | **Still blocking.** The WebSocket URL Mobi.e issued for this charge point. Read it out of the charger's current OCPP configuration. |
+| Mobi.e endpoint | **Resolved.** `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058`, read from the charger's own OCPP configuration. Charge Point ID `MOBI-ALM-00058`; the proxy is configured with the base `ws://10.200.10.200/ocpp/1.6` and appends the ID. |
 | Charger address | **Still blocking.** The charger has not appeared on either network — no DHCP lease and no ARP entry on `192.168.51.0/24` or `192.168.50.0/24`. |
 
 ### The APN is a closed network — measured, not assumed
@@ -61,14 +61,35 @@ Verified 2026-08-31 while the modem reported a healthy connected LTE session:
 This is a private APN behaving correctly, **not a fault**. Two consequences
 that shape the deployment:
 
-1. **Name resolution and transport take different paths.** The proxy resolves
-   the Mobi.e hostname through the LXC's LAN resolver, then connects over the
-   APN. If the name does not resolve publicly, or resolves to an address not
-   reachable inside the APN, the endpoint must be configured by IP — there is
-   no DNS on the mobile path to fall back on.
+1. **The DNS gap costs nothing.** The Central System turned out to be a literal
+   private address, `10.200.10.200`, so there is nothing to resolve. Had it
+   been a hostname, the absence of DNS on this path would have been a problem.
 2. **Never health-check the WWAN path against a public host.** No public host
-   is reachable. `PROBE_HOST` in `/etc/default/ocpp-wwan` must be the Mobi.e
-   endpoint or left empty.
+   is reachable, and ICMP is dropped even when the path works. The watchdog
+   makes a TCP connection to `10.200.10.200:80` instead — set `PROBE_HOST` and
+   `PROBE_PORT` in `/etc/default/ocpp-wwan`.
+3. **Nothing is encrypted between the proxy and Mobi.e.** The endpoint is
+   plaintext `ws://` on port 80; the private APN is the entire security
+   boundary. That is the charger's own pre-existing arrangement, not something
+   this design introduced — but it means the upstream leg needs no TLS at all.
+
+### Routing: destination, not source
+
+Because Mobi.e sits at a fixed RFC1918 range that collides with nothing here, a
+plain destination route is enough and no policy rules or routing tables are
+involved:
+
+```
+host:      ip route add 10.200.10.0/24 via 192.168.0.1  dev wwan0
+container: ip route add 10.200.10.0/24 via 10.80.0.1    dev eth1
+```
+
+This replaces the earlier source-address policy-routing scheme. It is simpler,
+keeps the application out of routing entirely (no `upstream_bind_address` to
+configure or keep in sync), and removes the two-place `ip rule` arrangement
+that was the easiest thing to get wrong. The route is still needed in **both**
+places: the container must hand the packet to the host across `vmbr2`, and the
+host must forward it out `wwan0` rather than back to the LAN.
 
 ## Step 1 — Host: pin the dongle's name
 
@@ -115,6 +136,33 @@ ssh proxmox 'ip route show table 100; ip rule show | grep 10.80.0.2'
 ssh proxmox 'ip route get <mobie-ip> from 10.80.0.2'   # expect "dev wwan0"
 ```
 
+Then prove the endpoint itself is reachable. TCP, not ping — this APN drops
+ICMP even when it is working:
+
+```bash
+ssh proxmox 'ip route get 10.200.10.200'                       # expect dev wwan0
+ssh proxmox 'timeout 8 bash -c "</dev/tcp/10.200.10.200/80" && echo REACHABLE'
+```
+
+For a full protocol-level check, a WebSocket upgrade should return
+`101 Switching Protocols` with `Sec-WebSocket-Protocol: ocpp1.6`:
+
+```bash
+ssh proxmox 'curl -i --http1.1 -m 10 \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  -H "Sec-WebSocket-Protocol: ocpp1.6" \
+  http://10.200.10.200/ocpp/1.6/MOBI-ALM-00058'
+```
+
+A 400/403/404 still proves the path works — Mobi.e is merely refusing that
+handshake. Only a timeout means the path is broken.
+
+> Do not run this while the charger is live on the same Charge Point ID.
+> Mobi.e may close the charger's session in favour of the new connection, the
+> same replacement behaviour this proxy implements for its own downstream.
+
 A default route appearing on `wwan0` in the main table is the failure to watch
 for: it silently pulls Proxmox updates and the Claude runners over a metered
 mobile link. This is why the interface is configured static with no `gateway`
@@ -127,12 +175,12 @@ scp host/wwan-watchdog.sh            proxmox:/usr/local/sbin/
 scp host/ocpp-wwan-watchdog.service  proxmox:/etc/systemd/system/
 scp host/ocpp-wwan-watchdog.timer    proxmox:/etc/systemd/system/
 ssh proxmox 'chmod 750 /usr/local/sbin/wwan-watchdog.sh'
-ssh proxmox 'printf "WWAN_GW=192.168.0.1\nPROBE_HOST=\n" > /etc/default/ocpp-wwan'
+ssh proxmox 'printf "WWAN_GW=192.168.0.1\nPROBE_HOST=10.200.10.200\nPROBE_PORT=80\n" > /etc/default/ocpp-wwan'
 ssh proxmox 'systemctl daemon-reload && systemctl enable --now ocpp-wwan-watchdog.timer'
 ```
 
-It checks the link, the table-100 route, the policy rule, the NAT rule and the
-MSS clamp every 5 minutes, repairs what is missing, and logs to syslog under
+It checks the link, the Mobi.e route, the NAT rule and the MSS clamp every
+5 minutes, repairs what is missing, and logs to syslog under
 tag `ocpp-wwan` — which LXC 101 collects. Same check-repair-log pattern as
 `iot-isolation-enforce.sh`, and for the same reason: state you set up once does
 not stay set up.

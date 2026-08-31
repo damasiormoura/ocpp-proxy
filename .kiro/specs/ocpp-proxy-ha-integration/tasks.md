@@ -284,11 +284,10 @@ Added when the deployment model moved from AWS ECS to a Proxmox LXC with a 4G
 APN uplink. Tasks 15–17 depend on the fixes in 10.3, 10.4, 11.1 and 13.1.
 
 - [ ] 15. Adapt the application to the new deployment
-  - [ ] 15.1 Add `listen_address` and `upstream_bind_address` configuration
-    - Bind the charger listener to `listen_address` (default `0.0.0.0`)
-    - Bind the upstream socket's local source address to `upstream_bind_address`, so host policy routing sends Mobi.e traffic over the APN
-    - Fail startup if `upstream_bind_address` is not present on any local interface, rather than silently using the default route
-    - _Requirements: 2.7, 2.8, 2.9, 7.4b_
+  - [ ] 15.1 Add `listen_address` configuration
+    - Bind the charger listener to `listen_address` (default `0.0.0.0`); set to the LXC's `vmbr1` address so the listener is not exposed on the WWAN-egress or main-LAN legs
+    - `upstream_bind_address` is **no longer required**: Mobi.e is a fixed RFC1918 range (`10.200.10.0/24`), so egress is selected by destination route on the host and in the container. Keep the parameter optional for a possible future move to a hostname
+    - _Requirements: 7.4, 13.5_
   - [ ] 15.2 Make MQTT TLS optional
     - `ca_cert_path`, `client_cert_path`, `client_key_path` become `Option<String>`
     - None => plaintext; ca only => server-auth TLS; all three => mutual TLS
@@ -323,13 +322,15 @@ APN uplink. Tasks 15–17 depend on the fixes in 10.3, 10.4, 11.1 and 13.1.
 
 - [ ] 19. Host and network provisioning (`deploy/lxc/README.md`)
   - [ ] 19.1 Pin the dongle to `wwan0` by USB ID before inserting the SIM — the MAC-derived `enx*` name will change once a SIM registers
-  - [ ] 19.2 Insert SIM, set the APN in the dongle's web UI, record its subnet and gateway, fill the config placeholders
-  - [ ] 19.3 Apply host networking: `vmbr2`, `wwan0` static with no default route, policy rule, MASQUERADE, MSS clamp
+  - [x] 19.2 Insert SIM and record the dongle's subnet and gateway — `192.168.0.0/24` via `192.168.0.1`, LTE, full signal, `ppp_connected`, operator NOS
+  - [ ] 19.3 Apply host networking: `vmbr2`, `wwan0` static with no default route, `10.200.10.0/24` destination route, MASQUERADE, MSS clamp
   - [ ] 19.4 Install the WWAN watchdog timer
   - [ ] 19.5 Create LXC 113, update `network/addressing.md` and `proxmox/inventory.md` in the mouraishikawa repo
   - [ ] 19.6 Give the charger a DHCP reservation and apply the Proxmox firewall rules on LXC 113
-  - [ ] 19.7 **Record the charger's original Mobi.e URL and OCPP settings before repointing it** — the manual bypass in Requirement 11.13 is impossible without them
-  - [ ] 19.8 Confirm whether the Mobi.e hostname resolves publicly or only via APN DNS; add a dnsmasq `server=/<zone>/` entry if needed
+  - [x] 19.7 **Record the charger's original Mobi.e URL** — `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058`. Still to capture: the rest of the charger's OCPP settings, for the Requirement 11.13 bypass
+  - [x] 19.8 DNS question resolved — the endpoint is a literal IP, so no resolver configuration is needed on the APN path
+  - [ ] 19.9 Verify the endpoint over the APN: TCP to `10.200.10.200:80`, then a WebSocket upgrade expecting `101` with `Sec-WebSocket-Protocol: ocpp1.6`. Do not run against a live charger session on the same Charge Point ID
+  - [ ] 19.10 Get the charger onto the IoT network — it currently has no DHCP lease and no ARP entry on either segment
 
 - [ ] 14. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
