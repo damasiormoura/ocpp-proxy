@@ -67,6 +67,15 @@ mqtt:
   port: 1883
   # username / password come from secrets.env
 
+# --- Durable state ---------------------------------------------------------
+# Where the retained charge point snapshot is kept, so the previous session's
+# figures survive a restart of this service rather than going `unavailable` in
+# Home Assistant until the next charge ends.
+#
+# The directory is created by `StateDirectory=ocpp-proxy` in the unit file.
+# Set to "" to turn persistence off.
+state_file: "/var/lib/ocpp-proxy/state.json"
+
 logging:
   level: INFO
 

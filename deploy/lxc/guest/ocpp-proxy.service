@@ -4,6 +4,14 @@ Documentation=https://github.com/damasiormoura/ocpp-proxy
 After=network-online.target ocpp-routes.service
 Wants=network-online.target ocpp-routes.service
 
+# Disables the restart rate limit, so `Restart=always` in [Service] really does
+# mean always. This key belongs in [Unit]: systemd logs "Unknown key
+# 'StartLimitIntervalSec' in section [Service], ignoring" if it is put next to
+# Restart=, and quietly keeps the default burst limit of 5 restarts in 10s —
+# after which the only thing standing between the charger and Mobi.e stays down
+# until someone notices.
+StartLimitIntervalSec=0
+
 # Wants, not Requires. If the routes fail the proxy still starts, reports
 # itself unhealthy and publishes that over MQTT, which is a louder signal than
 # a systemd unit sitting inactive with nobody watching it. It also keeps the
@@ -26,7 +34,6 @@ ExecStart=/usr/local/bin/ocpp-proxy
 # check. systemd is the whole recovery story, so it must never give up.
 Restart=always
 RestartSec=5s
-StartLimitIntervalSec=0
 
 # SIGTERM then 15s: the proxy budgets 10s to drain in-flight messages and 5s
 # for close acknowledgements. Anything longer is a hang worth killing.
@@ -41,7 +48,14 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ocpp-proxy
+# StateDirectory rather than a bare ReadWritePaths: it creates
+# /var/lib/ocpp-proxy owned by ocpp:ocpp on first start and grants write access
+# under ProtectSystem=strict, so nothing has to be provisioned by hand. The
+# proxy keeps its retained charge point snapshot there — see `state_file` in
+# config.yaml — which is what makes the previous session's figures survive a
+# restart of this unit.
+StateDirectory=ocpp-proxy
+StateDirectoryMode=0750
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

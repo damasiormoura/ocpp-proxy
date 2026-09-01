@@ -39,6 +39,7 @@ fn valid_config_with_files(
             level: LogLevel::Info,
         },
         buffers: BufferConfig::default(),
+        state_file: String::new(),
     }
 }
 
@@ -317,6 +318,7 @@ proptest! {
                 level: LogLevel::Info,
             },
             buffers: BufferConfig::default(),
+            state_file: String::new(),
         };
 
         let errors = config.validate();
@@ -407,6 +409,7 @@ proptest! {
                 level: LogLevel::Info,
             },
             buffers: BufferConfig::default(),
+            state_file: String::new(),
         };
 
         prop_assume!(listen_port != health_port);

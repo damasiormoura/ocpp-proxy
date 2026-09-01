@@ -88,6 +88,20 @@ pub struct ProxyConfig {
     pub logging: LogConfig,
     #[serde(default)]
     pub buffers: BufferConfig,
+    /// Where to persist the retained charge point snapshot.
+    ///
+    /// Defaults to the systemd `StateDirectory` the unit declares. Set to an
+    /// empty string to turn persistence off, in which case a proxy restart
+    /// blanks the previous-session figures in Home Assistant until the next
+    /// session ends — see `snapshot_store`.
+    #[serde(default = "default_state_file")]
+    pub state_file: String,
+}
+
+/// Matches `StateDirectory=ocpp-proxy` in the systemd unit, which creates the
+/// directory and hands it to the service already owned and writable.
+fn default_state_file() -> String {
+    "/var/lib/ocpp-proxy/state.json".to_string()
 }
 
 /// MQTT broker connection configuration.
@@ -396,6 +410,7 @@ mod tests {
                 level: LogLevel::Info,
             },
             buffers: BufferConfig::default(),
+            state_file: default_state_file(),
         }
     }
 
@@ -566,6 +581,7 @@ mod tests {
             },
             logging: LogConfig::default(),
             buffers: BufferConfig::default(),
+            state_file: default_state_file(),
         };
         let errors = config.validate();
         // Should report all errors, not just the first

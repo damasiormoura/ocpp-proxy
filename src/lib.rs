@@ -8,5 +8,6 @@ pub mod models;
 pub mod mqtt;
 pub mod session;
 pub mod shutdown;
+pub mod snapshot_store;
 pub mod state;
 pub mod upstream;

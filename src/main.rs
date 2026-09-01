@@ -31,6 +31,7 @@ use ocpp_proxy::models::{ConnectionId, ConnectionState};
 use ocpp_proxy::mqtt::MqttPublisher;
 use ocpp_proxy::session::SessionConfig;
 use ocpp_proxy::shutdown::{self, log_startup_begin, log_startup_complete, ShutdownCoordinator};
+use ocpp_proxy::snapshot_store::SnapshotStore;
 use ocpp_proxy::state::ConnectionStateManager;
 
 /// Upstream connect timeout (Requirement 2.4).
@@ -106,6 +107,24 @@ async fn main() {
     let mqtt_config = config.mqtt.clone();
     let mqtt_lwt_id = config.charge_point_id.clone();
     let mqtt_buffer_size = config.buffers.mqtt_buffer_size;
+    // An empty path disables persistence; anything else is the snapshot file.
+    let snapshot_store = if config.state_file.trim().is_empty() {
+        info!(
+            component = "main",
+            "Snapshot persistence disabled; previous-session figures will not \
+             survive a proxy restart"
+        );
+        SnapshotStore::disabled()
+    } else {
+        let store = SnapshotStore::new(Some(std::path::PathBuf::from(&config.state_file)));
+        info!(
+            component = "main",
+            path = ?store.path(),
+            "Charge point snapshot persisted across restarts"
+        );
+        store
+    };
+    debug_assert!(snapshot_store.is_enabled() || config.state_file.trim().is_empty());
     let state_for_mqtt = state_manager.clone();
     let mqtt_shutdown = shutdown_token.clone();
 
@@ -129,6 +148,7 @@ async fn main() {
                     mqtt_lwt_id,
                     mqtt_rx,
                     mqtt_buffer_size,
+                    snapshot_store,
                 ) {
                     Ok(p) => p,
                     Err(e) => {

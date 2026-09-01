@@ -161,12 +161,24 @@ proxy never saw the matching `StartTransaction` — a proxy restart mid-session.
 The delta is genuinely unknown then, and a zero would silently understate a real
 charge.
 
-**Known limit: the snapshot is in-memory.** It survives a Home Assistant restart,
-which is what it was built for, but not a *proxy* restart — a deploy or an LXC
-reboot starts the snapshot empty, and the first message the charger sends
-republishes it with every `last_*` field null. The three previous-session rows
-then read `unavailable` until the next session ends. Closing that would mean
-giving the proxy somewhere durable to keep the snapshot: seeding it back from
-this retained topic at startup (the broker already stores it, though the seed
-races the charger's first message) or writing it to a file under a systemd
-`StateDirectory`. Neither is implemented.
+**The snapshot is durable.** It survives a Home Assistant restart, which is what
+it was built for, and also a *proxy* restart: the proxy writes it to
+`/var/lib/ocpp-proxy/state.json` on every change and reads it back before its
+event loop starts, then republishes it onto the retained topic on the first
+broker connection. A deploy or an LXC reboot therefore leaves the
+previous-session rows populated.
+
+A file rather than seeding from this retained topic, which needs no disk: the
+charger reconnects within a few seconds of the proxy starting, and if its first
+StatusNotification were folded in before the seed arrived, the republish would
+clobber the retained topic with a blank snapshot. Reading a file happens before
+the event loop exists, so there is no race to lose — and it survives a broker
+that came back without its own retained store, which the proxy then repairs by
+republishing.
+
+Nothing about it is fatal: an unwritable or corrupt file is a warning and an
+empty snapshot, never a failure to start. The proxy is the charger's only route
+to Mobi.e, so losing dashboard history must never cost charging.
+
+Restarting the proxy mid-session restores the open transaction too, so a session
+interrupted by a deploy still gets its delivered figure when it ends.

@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use rumqttc::TlsConfiguration;
 use rumqttc::{AsyncClient, Event, EventLoop, Incoming, LastWill, MqttOptions, QoS, Transport};
+
+use crate::snapshot_store::SnapshotStore;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -256,6 +258,9 @@ pub struct MqttPublisher {
     backoff: ExponentialBackoff,
     /// Retained snapshot of the charge point, per Charge Point ID.
     charge_point_state: std::collections::HashMap<String, ChargePointState>,
+    /// Durable backing for `charge_point_state`, so a proxy restart does not
+    /// lose what the last session recorded. See `snapshot_store`.
+    snapshot_store: SnapshotStore,
 }
 
 impl MqttPublisher {
@@ -274,6 +279,7 @@ impl MqttPublisher {
         lwt_charge_point_id: Option<String>,
         event_rx: mpsc::Receiver<MqttEvent>,
         max_buffer_size: usize,
+        snapshot_store: SnapshotStore,
     ) -> Result<Self, ProxyError> {
         let client_id = match &lwt_charge_point_id {
             Some(id) => format!("ocpp-proxy-{}", id),
@@ -330,7 +336,10 @@ impl MqttPublisher {
                 Duration::from_secs(1),
                 Duration::from_secs(30),
             ),
-            charge_point_state: std::collections::HashMap::new(),
+            // Loaded here, before the event loop exists, so nothing can
+            // fold a message in ahead of the restore.
+            charge_point_state: snapshot_store.load(),
+            snapshot_store,
         })
     }
 
@@ -424,6 +433,8 @@ impl MqttPublisher {
                             e
                         );
                     }
+
+                    self.republish_snapshots().await;
 
                     return Ok(true);
                 }
@@ -525,6 +536,8 @@ impl MqttPublisher {
 
                             // Flush buffered messages
                             self.flush_buffer().await;
+
+                            self.republish_snapshots().await;
                         }
                         Ok(_) => {
                             // Other events (PubAck, PingResp, etc.) — handled by rumqttc internally
@@ -673,6 +686,7 @@ impl MqttPublisher {
                     }
                 };
                 if let Some(snapshot) = snapshot {
+                    self.snapshot_store.save(&self.charge_point_state);
                     self.publish_charge_point_state(&charge_point_id, &snapshot)
                         .await;
                 }
@@ -756,6 +770,32 @@ impl MqttPublisher {
     /// Retained and QoS 1: a subscriber that connects later must be told the
     /// current state immediately rather than waiting for the charger's next
     /// transition, which during an idle night is hours away.
+    /// Push every snapshot we hold back onto its retained topic.
+    ///
+    /// Called after each ConnAck, which covers two cases. At startup it
+    /// restores what the file gave us, so a subscriber sees the previous
+    /// session immediately rather than after the charger's next message
+    /// republishes a blank one. After a reconnect it repairs a broker that
+    /// came back without its retained store.
+    async fn republish_snapshots(&mut self) {
+        let snapshots: Vec<(String, ChargePointState)> = self
+            .charge_point_state
+            .iter()
+            .map(|(id, st)| (id.clone(), st.clone()))
+            .collect();
+        if snapshots.is_empty() {
+            return;
+        }
+        info!(
+            component = "mqtt",
+            charge_points = snapshots.len(),
+            "Republishing retained charge point snapshots"
+        );
+        for (id, snapshot) in snapshots {
+            self.publish_charge_point_state(&id, &snapshot).await;
+        }
+    }
+
     async fn publish_charge_point_state(
         &mut self,
         charge_point_id: &str,
@@ -930,6 +970,19 @@ mod tests {
     fn call(action: &str) -> OcppMessageType {
         OcppMessageType::Call {
             action: action.to_string(),
+        }
+    }
+
+    /// The deployed shape: a broker one LAN hop away, no TLS.
+    fn plaintext_config() -> MqttConfig {
+        MqttConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1883,
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
         }
     }
 
@@ -1451,13 +1504,137 @@ mod tests {
         };
 
         let (_tx, rx) = mpsc::channel(100);
-        let publisher = MqttPublisher::new(&config, Some("CP001".to_string()), rx, 500);
+        let publisher = MqttPublisher::new(
+            &config,
+            Some("CP001".to_string()),
+            rx,
+            500,
+            SnapshotStore::disabled(),
+        );
         assert!(publisher.is_ok());
 
         let publisher = publisher.unwrap();
         assert_eq!(publisher.lwt_charge_point_id().unwrap(), "CP001");
         assert_eq!(publisher.state(), ConnectionState::Disconnected);
         assert_eq!(publisher.buffer_len(), 0);
+    }
+
+    /// A publisher built against a store that already has a session in it
+    /// starts with that session, not empty.
+    ///
+    /// This is the restart path: `new` is what a restarted process calls, and
+    /// it must load before the event loop can fold anything in.
+    #[tokio::test]
+    async fn test_publisher_restores_the_stored_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        // What the previous process would have written.
+        let store = SnapshotStore::new(Some(path.clone()));
+        let mut before = crate::snapshot_store::SnapshotMap::new();
+        let mut st = ChargePointState::default();
+        st.apply(
+            "StartTransaction",
+            &call("StartTransaction"),
+            r#"[2,"1","StartTransaction",{"connectorId":1,"idTag":"7264b25e","meterStart":8076445}]"#,
+        );
+        st.apply(
+            "StopTransaction",
+            &call("StopTransaction"),
+            r#"[2,"2","StopTransaction",{"meterStop":8084000,"transactionId":1788214378}]"#,
+        );
+        before.insert("MOBI-ALM-00058".to_string(), st);
+        store.save(&before);
+
+        // What the restarted process builds.
+        let config = plaintext_config();
+        let (_tx, rx) = mpsc::channel(100);
+        let publisher = MqttPublisher::new(
+            &config,
+            Some("MOBI-ALM-00058".to_string()),
+            rx,
+            500,
+            SnapshotStore::new(Some(path)),
+        )
+        .unwrap();
+
+        let restored = publisher
+            .charge_point_state
+            .get("MOBI-ALM-00058")
+            .expect("the stored snapshot must be loaded by `new`");
+        assert_eq!(restored.last_meter_stop_wh, Some(8084000));
+        assert_eq!(restored.last_session_energy_wh, Some(7555));
+        assert_eq!(restored.last_transaction_id, Some(1788214378));
+    }
+
+    /// Every snapshot change is persisted, including while the broker is
+    /// unreachable — the restart it has to survive is often the same event that
+    /// took the broker away.
+    #[tokio::test]
+    async fn test_snapshot_change_is_persisted_even_when_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let config = plaintext_config();
+        let (_tx, rx) = mpsc::channel(100);
+        let mut publisher = MqttPublisher::new(
+            &config,
+            Some("CP001".to_string()),
+            rx,
+            500,
+            SnapshotStore::new(Some(path.clone())),
+        )
+        .unwrap();
+        assert_eq!(publisher.state(), ConnectionState::Disconnected);
+
+        publisher
+            .handle_event(MqttEvent::MessageForwarded {
+                charge_point_id: "CP001".to_string(),
+                frame: crate::models::OcppFrame::parse(
+                    r#"[2,"1","StopTransaction",{"meterStop":4200,"transactionId":9}]"#,
+                )
+                .unwrap(),
+                direction: Direction::ChargerToCentral,
+                action: "StopTransaction".to_string(),
+            })
+            .await;
+
+        let reloaded = SnapshotStore::new(Some(path)).load();
+        assert_eq!(reloaded["CP001"].last_meter_stop_wh, Some(4200));
+        assert_eq!(reloaded["CP001"].last_transaction_id, Some(9));
+    }
+
+    /// MeterValues does not change the snapshot, so it must not cause a write
+    /// either — it arrives every few seconds during a charge.
+    #[tokio::test]
+    async fn test_meter_values_does_not_write_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let config = plaintext_config();
+        let (_tx, rx) = mpsc::channel(100);
+        let mut publisher = MqttPublisher::new(
+            &config,
+            Some("CP001".to_string()),
+            rx,
+            500,
+            SnapshotStore::new(Some(path.clone())),
+        )
+        .unwrap();
+
+        publisher
+            .handle_event(MqttEvent::MessageForwarded {
+                charge_point_id: "CP001".to_string(),
+                frame: crate::models::OcppFrame::parse(
+                    r#"[2,"1","MeterValues",{"connectorId":1,"meterValue":[{"sampledValue":[{"value":"3651"}]}]}]"#,
+                )
+                .unwrap(),
+                direction: Direction::ChargerToCentral,
+                action: "MeterValues".to_string(),
+            })
+            .await;
+
+        assert!(!path.exists(), "MeterValues must not touch the state file");
     }
 
     #[test]
@@ -1473,7 +1650,13 @@ mod tests {
         };
 
         let (_tx, rx) = mpsc::channel(100);
-        let result = MqttPublisher::new(&config, Some("CP001".to_string()), rx, 500);
+        let result = MqttPublisher::new(
+            &config,
+            Some("CP001".to_string()),
+            rx,
+            500,
+            SnapshotStore::disabled(),
+        );
         assert!(result.is_err());
     }
 
