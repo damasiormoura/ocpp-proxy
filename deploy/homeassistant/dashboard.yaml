@@ -69,43 +69,55 @@ views:
       # ---------------------------------------------------------------
       # Live power and the session in progress
       # ---------------------------------------------------------------
-      - type: horizontal-stack
-        cards:
-          - type: gauge
-            entity: sensor.ev_charger_mobi_alm_00058_charger_power
-            name: Power
-            unit: W
-            min: 0
-            max: 7400
-            severity:
-              green: 0
-              yellow: 7000
-              red: 7300
-          - type: gauge
-            entity: sensor.ev_charger_mobi_alm_00058_charger_current_l1
-            name: Current L1
-            unit: A
-            min: 0
-            max: 32
-            severity:
-              green: 0
-              yellow: 30
-              red: 31
-
-      # StatusNotification / StartTransaction are event topics and are not
-      # retained, so these read "unknown" after a Home Assistant restart until
-      # the charger next changes state. The markdown card below says so rather
-      # than leaving a wall of "Unknown" looking like a fault.
+      # Gauges only while there is a live reading. The gauge card requires a
+      # numeric state and renders "Entity is non-numeric" against `unknown`,
+      # which is what power and current read whenever no session is running —
+      # the charger sends MeterValues only during a charge. Two permanent error
+      # cards on an idle dashboard look like a fault and are not one.
+      #
+      # Conditions are ANDed. `unavailable` is excluded too: that is the proxy
+      # being down, which the banner at the top already reports.
       - type: conditional
         conditions:
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_status
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
+            state_not: "unknown"
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
+            state_not: "unavailable"
+        card:
+          type: horizontal-stack
+          cards:
+            - type: gauge
+              entity: sensor.ev_charger_mobi_alm_00058_charger_power
+              name: Power
+              unit: W
+              min: 0
+              max: 7400
+              severity:
+                green: 0
+                yellow: 7000
+                red: 7300
+            - type: gauge
+              entity: sensor.ev_charger_mobi_alm_00058_charger_current_l1
+              name: Current L1
+              unit: A
+              min: 0
+              max: 32
+              severity:
+                green: 0
+                yellow: 30
+                red: 31
+
+      # ...and a line in their place when there is nothing to show, so the
+      # space does not just go blank.
+      - type: conditional
+        conditions:
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
             state: "unknown"
         card:
           type: markdown
           content: >
-            *Waiting for the charger's next status update — these fields fill
-            in when it next changes state or starts a transaction. Live power
-            and energy above are unaffected.*
+            *No live power reading. The charger reports MeterValues only while a
+            session is running, so these fill in when a car is plugged in.*
 
       - type: entities
         title: This session
