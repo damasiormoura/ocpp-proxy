@@ -92,8 +92,24 @@ list and length-check it rather than using `| first`, which raises on an empty
 sequence and takes the sensor unavailable. All templates were validated
 against captured live payloads including the reduced and empty cases.
 
-**Session energy after a restart.** `sensor.ev_charger_mobi_alm_00058_charger_session_meter_start` comes
-from a `StartTransaction` message, which is not retained. If Home Assistant
-restarts mid-session, `sensor.charger_session_energy` reads `unknown` until the
-next transaction begins. The lifetime meter and the Energy dashboard are
-unaffected.
+**What survives a Home Assistant restart, and what does not.**
+
+Connector status, error code, transaction ID and session meter start come from
+the **retained** `ocpp/{id}/state` topic, so they are correct the instant Home
+Assistant subscribes. Verified across a restart: status read `Available` and
+transaction `none` immediately, with no wait for the charger to do anything.
+
+Power, current, voltage and the lifetime energy meter come from `MeterValues`,
+which the charger only sends **during a session**. While nothing is plugged in
+they read `unknown` after a restart, and repopulate on the next charge. That is
+truthful rather than broken — there is no current power reading when no car is
+connected. They are deliberately not in the retained snapshot: `MeterValues`
+arrives every few seconds while charging, and retaining it would mean a
+retained publish per meter reading.
+
+The Energy dashboard is unaffected either way: it is built from long-term
+statistics in the database, not from the live state.
+
+`sensor.charger_session_meter_start` reports `unavailable` while no transaction
+is open, which is why `sensor.charger_session_energy` is also unavailable then
+rather than showing a stale or zero figure.
