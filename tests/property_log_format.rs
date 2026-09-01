@@ -248,7 +248,7 @@ proptest! {
             // The message should appear either in fields.message or somewhere in the JSON
             let message_found = if let Some(fields_val) = fields {
                 if let Some(msg_val) = fields_val.get("message") {
-                    msg_val.as_str().map_or(false, |m| m.contains(&message))
+                    msg_val.as_str().is_some_and(|m| m.contains(&message))
                 } else {
                     full_output.contains(&message)
                 }

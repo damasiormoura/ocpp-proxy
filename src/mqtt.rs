@@ -67,6 +67,37 @@ pub struct ChargePointState {
     pub id_tag: Option<String>,
     /// Meter reading in Wh when the open transaction started.
     pub meter_start_wh: Option<i64>,
+
+    // The `last_*` fields below describe the transaction that most recently
+    // ENDED, so unlike the fields above they are deliberately never cleared:
+    // they have to survive both the next session starting and it ending. They
+    // exist because `StopTransaction` is an event topic, published
+    // non-retained — a consumer that subscribes afterwards has no way to learn
+    // what the previous session did until another one happens to end, which
+    // can be days.
+    /// Meter reading in Wh when the last completed transaction closed.
+    pub last_meter_stop_wh: Option<i64>,
+    /// Energy delivered by the last completed transaction, in Wh.
+    ///
+    /// `meterStop - meterStart`, computed while the start reading is still in
+    /// the snapshot. `None` when the proxy never saw the matching
+    /// `StartTransaction` — after a restart mid-session, say — because the
+    /// figure is then genuinely unknown rather than zero. Not clamped: a
+    /// negative would mean the charger's register went backwards, which is
+    /// worth seeing rather than hiding behind a floor of zero.
+    pub last_session_energy_wh: Option<i64>,
+    /// Transaction id of the last completed transaction.
+    pub last_transaction_id: Option<i64>,
+    /// Why the last transaction ended: EVDisconnected, Local, Remote, ...
+    ///
+    /// Optional in OCPP 1.6; some chargers omit it.
+    pub last_stop_reason: Option<String>,
+    /// The charger's own timestamp for the end of the last transaction.
+    ///
+    /// Distinct from `last_updated`, which is when the proxy folded the
+    /// message in. They differ if the charger buffered the message offline.
+    pub last_stop_time: Option<String>,
+
     /// ISO 8601 time this snapshot last changed.
     pub last_updated: Option<String>,
 }
@@ -103,6 +134,30 @@ impl ChargePointState {
                 self.transaction_id = args.get("transactionId").and_then(|v| v.as_i64());
             }
             ("StopTransaction", OcppMessageType::Call { .. }) => {
+                // Record the session that just ended BEFORE clearing the open
+                // one: the delivered-energy delta needs `meter_start_wh`, and
+                // the clear below drops it.
+                let meter_stop = args.get("meterStop").and_then(|v| v.as_i64());
+                self.last_meter_stop_wh = meter_stop;
+                self.last_session_energy_wh = match (meter_stop, self.meter_start_wh) {
+                    (Some(stop), Some(start)) => Some(stop - start),
+                    _ => None,
+                };
+                // The message carries the id it is closing; prefer it over the
+                // snapshot's, which is empty if the proxy missed the start.
+                self.last_transaction_id = args
+                    .get("transactionId")
+                    .and_then(|v| v.as_i64())
+                    .or(self.transaction_id);
+                self.last_stop_reason = args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                self.last_stop_time = args
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
                 self.transaction_id = None;
                 self.id_tag = None;
                 self.meter_start_wh = None;
@@ -965,7 +1020,7 @@ mod tests {
         st.apply(
             "StopTransaction",
             &call("StopTransaction"),
-            r#"[2,"4","StopTransaction",{"idTag":"7264b25e","meterStop":8080000,"transactionId":1788214378}]"#,
+            r#"[2,"4","StopTransaction",{"idTag":"7264b25e","meterStop":8080000,"transactionId":1788214378,"reason":"EVDisconnected","timestamp":"2026-09-01T07:22:16Z"}]"#,
         );
         assert_eq!(st.transaction_id, None);
         assert_eq!(st.meter_start_wh, None);
@@ -974,6 +1029,101 @@ mod tests {
             st.connector_status.as_deref(),
             Some("Charging"),
             "StopTransaction does not itself change connector status"
+        );
+
+        // ...and must record what the session that just ended did.
+        assert_eq!(st.last_meter_stop_wh, Some(8080000));
+        assert_eq!(st.last_session_energy_wh, Some(8080000 - 8076445));
+        assert_eq!(st.last_transaction_id, Some(1788214378));
+        assert_eq!(st.last_stop_reason.as_deref(), Some("EVDisconnected"));
+        assert_eq!(st.last_stop_time.as_deref(), Some("2026-09-01T07:22:16Z"));
+    }
+
+    /// The regression this whole `last_*` group exists to prevent.
+    ///
+    /// A new session starting, and then ending, must not wipe what the
+    /// previous one recorded before its own figures are in place — the Home
+    /// Assistant sensor reads this topic continuously and would otherwise
+    /// blink to null between the two.
+    #[test]
+    fn test_last_session_survives_the_next_session() {
+        let mut st = ChargePointState::default();
+        st.apply(
+            "StartTransaction",
+            &call("StartTransaction"),
+            r#"[2,"1","StartTransaction",{"connectorId":1,"idTag":"a","meterStart":1000}]"#,
+        );
+        st.apply(
+            "StopTransaction",
+            &call("StopTransaction"),
+            r#"[2,"2","StopTransaction",{"meterStop":3000,"transactionId":7}]"#,
+        );
+        assert_eq!(st.last_session_energy_wh, Some(2000));
+
+        // A second session opens. The previous session's figures stay put.
+        st.apply(
+            "StartTransaction",
+            &call("StartTransaction"),
+            r#"[2,"3","StartTransaction",{"connectorId":1,"idTag":"b","meterStart":3000}]"#,
+        );
+        assert_eq!(st.last_meter_stop_wh, Some(3000));
+        assert_eq!(st.last_session_energy_wh, Some(2000));
+        assert_eq!(st.last_transaction_id, Some(7));
+
+        st.apply(
+            "StopTransaction",
+            &call("StopTransaction"),
+            r#"[2,"4","StopTransaction",{"meterStop":9500,"transactionId":8}]"#,
+        );
+        assert_eq!(st.last_meter_stop_wh, Some(9500));
+        assert_eq!(st.last_session_energy_wh, Some(6500));
+        assert_eq!(st.last_transaction_id, Some(8));
+    }
+
+    /// After a proxy restart mid-session the start reading is gone, so the
+    /// delta is unknowable. Reporting zero would understate a real charge on
+    /// the dashboard; `None` says so honestly. The meter stop reading itself
+    /// is still recorded, because the message carries it.
+    #[test]
+    fn test_stop_without_a_seen_start_reports_no_delta() {
+        let mut st = ChargePointState::default();
+        st.apply(
+            "StopTransaction",
+            &call("StopTransaction"),
+            r#"[2,"1","StopTransaction",{"meterStop":8084000,"transactionId":1788214378}]"#,
+        );
+        assert_eq!(st.last_meter_stop_wh, Some(8084000));
+        assert_eq!(
+            st.last_session_energy_wh, None,
+            "an unknown delta must not be reported as zero"
+        );
+        assert_eq!(st.last_transaction_id, Some(1788214378));
+    }
+
+    /// `reason` and `timestamp` are optional in OCPP 1.6 and this charger
+    /// omits `reason` on a locally stopped session.
+    #[test]
+    fn test_stop_without_optional_fields() {
+        let mut st = ChargePointState::default();
+        assert!(st.apply(
+            "StopTransaction",
+            &call("StopTransaction"),
+            r#"[2,"1","StopTransaction",{"meterStop":500,"transactionId":3}]"#,
+        ));
+        assert_eq!(st.last_stop_reason, None);
+        assert_eq!(st.last_stop_time, None);
+        assert_eq!(st.last_meter_stop_wh, Some(500));
+    }
+
+    /// A retried StopTransaction must not cause a second retained publish.
+    #[test]
+    fn test_repeated_stop_transaction_reports_no_change() {
+        let raw = r#"[2,"1","StopTransaction",{"meterStop":500,"transactionId":3}]"#;
+        let mut st = ChargePointState::default();
+        assert!(st.apply("StopTransaction", &call("StopTransaction"), raw));
+        assert!(
+            !st.apply("StopTransaction", &call("StopTransaction"), raw),
+            "an identical stop must not trigger another retained publish"
         );
     }
 
@@ -1021,6 +1171,33 @@ mod tests {
         assert_eq!(v["error_code"], "NoError");
         assert!(v["transaction_id"].is_null());
         assert!(v["last_updated"].is_string());
+
+        // The Home Assistant package reads these keys by name, so the wire
+        // shape is part of the contract rather than an implementation detail.
+        for key in [
+            "last_meter_stop_wh",
+            "last_session_energy_wh",
+            "last_transaction_id",
+            "last_stop_reason",
+            "last_stop_time",
+        ] {
+            assert!(
+                v.get(key).is_some(),
+                "{key} must be present in the retained snapshot"
+            );
+            assert!(v[key].is_null(), "{key} is null before any session ends");
+        }
+
+        st.apply(
+            "StopTransaction",
+            &call("StopTransaction"),
+            r#"[2,"9","StopTransaction",{"meterStop":8084000,"transactionId":1788214378,"reason":"EVDisconnected"}]"#,
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&st).unwrap()).unwrap();
+        assert_eq!(v["last_meter_stop_wh"], 8084000);
+        assert_eq!(v["last_transaction_id"], 1788214378);
+        assert_eq!(v["last_stop_reason"], "EVDisconnected");
     }
 
     #[test]

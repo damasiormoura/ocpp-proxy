@@ -182,21 +182,82 @@ mqtt:
           payload_not_available: "offline"
         - topic: "ocpp/MOBI-ALM-00058/state"
           value_template: >-
-            {{ 'online' if value_json.meter_start_wh is not none else 'offline' }}
+            {{ 'online' if (value_json.meter_start_wh | default(none)) is not none else 'offline' }}
           payload_available: "online"
           payload_not_available: "offline"
       device: *charger_device
 
+    # The two sensors below describe the session that most recently ENDED.
+    #
+    # They read the retained snapshot rather than the StopTransaction event
+    # topic they used to. That topic is published non-retained, so after a
+    # Home Assistant restart both sat at `unknown` until another session
+    # happened to end — which, with a car charged twice a week, is days of a
+    # blank row on the dashboard. The proxy keeps these fields across the next
+    # session precisely so this topic can answer the question at any time.
+    #
+    # `unique_id` is unchanged for the meter-stop sensor and it reports the
+    # same quantity as before, so its recorder history stays continuous.
     - name: "Charger Last Session Energy"
       unique_id: ocpp_charger_last_session_energy
-      state_topic: "ocpp/MOBI-ALM-00058/charger/StopTransaction"
+      state_topic: "ocpp/MOBI-ALM-00058/state"
       device_class: energy
       state_class: total
       unit_of_measurement: "kWh"
+      # The lifetime register reading at the moment the last session closed —
+      # not the energy that session delivered. That is the sensor below.
       value_template: >-
-        {{ (value_json.payload[3].meterStop | float(0) / 1000) | round(3) }}
-      json_attributes_topic: "ocpp/MOBI-ALM-00058/charger/StopTransaction"
-      json_attributes_template: "{{ value_json.payload[3] | tojson }}"
+        {{ ((value_json.last_meter_stop_wh | default(0, true)) | float(0) / 1000) | round(3) }}
+      json_attributes_topic: "ocpp/MOBI-ALM-00058/state"
+      availability_mode: all
+      availability:
+        - topic: "ocpp/MOBI-ALM-00058/availability"
+          payload_available: "online"
+          payload_not_available: "offline"
+        - topic: "ocpp/MOBI-ALM-00058/state"
+          value_template: >-
+            {{ 'online' if (value_json.last_meter_stop_wh | default(none)) is not none else 'offline' }}
+          payload_available: "online"
+          payload_not_available: "offline"
+      device: *charger_device
+
+    # Energy the last completed session actually delivered: meterStop minus
+    # meterStart, computed by the proxy while both were known.
+    #
+    # The proxy reports null rather than zero when it never saw the matching
+    # StartTransaction — a restart mid-session — and the availability template
+    # below turns that into `unavailable`. A zero here would silently understate
+    # a real charge.
+    - name: "Charger Last Session Delivered"
+      unique_id: ocpp_charger_last_session_delivered
+      state_topic: "ocpp/MOBI-ALM-00058/state"
+      device_class: energy
+      state_class: total
+      unit_of_measurement: "kWh"
+      icon: mdi:battery-charging
+      value_template: >-
+        {{ ((value_json.last_session_energy_wh | default(0, true)) | float(0) / 1000) | round(3) }}
+      availability_mode: all
+      availability:
+        - topic: "ocpp/MOBI-ALM-00058/availability"
+          payload_available: "online"
+          payload_not_available: "offline"
+        - topic: "ocpp/MOBI-ALM-00058/state"
+          value_template: >-
+            {{ 'online' if (value_json.last_session_energy_wh | default(none)) is not none else 'offline' }}
+          payload_available: "online"
+          payload_not_available: "offline"
+      device: *charger_device
+
+    - name: "Charger Last Session End Reason"
+      unique_id: ocpp_charger_last_session_end_reason
+      state_topic: "ocpp/MOBI-ALM-00058/state"
+      icon: mdi:power-plug-off-outline
+      # Optional in OCPP 1.6 and omitted by this charger on some stops, hence
+      # the explicit fallback rather than an availability gate — the row should
+      # stay on the dashboard next to the figures it explains.
+      value_template: >-
+        {{ value_json.last_stop_reason | default('Unknown', true) }}
       availability: *proxy_availability
       device: *charger_device
 

@@ -36,7 +36,9 @@ broker configuration is needed.
 | `sensor.ev_charger_mobi_alm_00058_charger_transaction_id` | `central_system/StartTransaction` | assigned by Mobi.e |
 | `sensor.ev_charger_mobi_alm_00058_charger_authorization` | `central_system/Authorize` | Accepted / Blocked / Invalid |
 | `sensor.ev_charger_mobi_alm_00058_charger_session_meter_start` | `charger/StartTransaction` | kWh at transaction open |
-| `sensor.ev_charger_mobi_alm_00058_charger_last_session_energy` | `charger/StopTransaction` | kWh at transaction close |
+| `sensor.ev_charger_mobi_alm_00058_charger_last_session_energy` | `state` | kWh on the register at transaction close |
+| `sensor.ev_charger_mobi_alm_00058_charger_last_session_delivered` | `state` | kWh the last session actually delivered |
+| `sensor.ev_charger_mobi_alm_00058_charger_last_session_end_reason` | `state` | `EVDisconnected`, `Local`, `Remote`, … |
 | `sensor.charger_session_energy` | template | energy delivered this session |
 | `sensor.ev_charger_mobi_alm_00058_ocpp_proxy_upstream` / `_downstream` | `status` | retained |
 | `binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online` | `availability` | driven by the MQTT Last Will |
@@ -94,10 +96,11 @@ against captured live payloads including the reduced and empty cases.
 
 **What survives a Home Assistant restart, and what does not.**
 
-Connector status, error code, transaction ID and session meter start come from
-the **retained** `ocpp/{id}/state` topic, so they are correct the instant Home
-Assistant subscribes. Verified across a restart: status read `Available` and
-transaction `none` immediately, with no wait for the charger to do anything.
+Connector status, error code, transaction ID, session meter start and the three
+previous-session figures all come from the **retained** `ocpp/{id}/state` topic,
+so they are correct the instant Home Assistant subscribes. Verified across a
+restart: status read `Available` and transaction `none` immediately, with no
+wait for the charger to do anything.
 
 Power, current, voltage and the lifetime energy meter come from `MeterValues`,
 which the charger only sends **during a session**. While nothing is plugged in
@@ -113,3 +116,57 @@ statistics in the database, not from the live state.
 `sensor.charger_session_meter_start` reports `unavailable` while no transaction
 is open, which is why `sensor.charger_session_energy` is also unavailable then
 rather than showing a stale or zero figure.
+
+## Testing the templates
+
+`render_check.py` renders every state-topic template against the payload shapes
+the broker actually serves — mid-session, after a session, a fresh snapshot, one
+where the proxy missed the StartTransaction, and the pre-change payload that has
+none of the `last_*` keys — and asserts both the state and the resolved
+availability for each:
+
+```
+python3 deploy/homeassistant/render_check.py     # needs pyyaml + jinja2
+```
+
+The templates are the one part of this integration with no compiler behind
+them, and they fail silently: a template that raises takes its sensor
+`unavailable` rather than logging anything obvious. Two real bugs were caught
+this way — `| first` raising on the reduced `MeterValues` this charger sends,
+and a missing key rendering a confident `0.000 kWh` instead of going
+unavailable.
+
+## The previous session, and why there are two numbers for it
+
+`..._charger_last_session_energy` is the **lifetime register reading** at the
+moment the last session closed. `..._charger_last_session_delivered` is what
+that session actually **delivered** — `meterStop - meterStart`, which the proxy
+computes while both readings are still in hand. For the 1 Sep session those were
+8084.000 kWh and 7.555 kWh respectively; confusing the two is easy and the
+second is almost always the one you want.
+
+They are two entities rather than one because the first already had recorder
+history under `state_class: total`. Redefining what it reports would have put a
+step of several thousand kWh in that history.
+
+Both were previously fed from the non-retained `charger/StopTransaction` topic
+and so read `unknown` after every Home Assistant restart, until another session
+happened to end. The proxy keeps `last_meter_stop_wh`, `last_session_energy_wh`,
+`last_transaction_id`, `last_stop_reason` and `last_stop_time` in the retained
+snapshot across the following session precisely so this topic can answer at any
+time.
+
+`..._charger_last_session_delivered` goes `unavailable`, not zero, when the
+proxy never saw the matching `StartTransaction` — a proxy restart mid-session.
+The delta is genuinely unknown then, and a zero would silently understate a real
+charge.
+
+**Known limit: the snapshot is in-memory.** It survives a Home Assistant restart,
+which is what it was built for, but not a *proxy* restart — a deploy or an LXC
+reboot starts the snapshot empty, and the first message the charger sends
+republishes it with every `last_*` field null. The three previous-session rows
+then read `unavailable` until the next session ends. Closing that would mean
+giving the proxy somewhere durable to keep the snapshot: seeding it back from
+this retained topic at startup (the broker already stores it, though the seed
+races the charger's first message) or writing it to a file under a systemd
+`StateDirectory`. Neither is implemented.

@@ -123,8 +123,16 @@ views:
           - entity: sensor.ev_charger_mobi_alm_00058_charger_authorization
             name: Last authorisation
           - type: divider
+          # These three come from the retained snapshot, so they are populated
+          # the moment Home Assistant subscribes rather than staying blank
+          # until the next session ends.
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_last_session_delivered
+            name: Previous session delivered
+            icon: mdi:battery-charging
           - entity: sensor.ev_charger_mobi_alm_00058_charger_last_session_energy
             name: Previous session meter stop
+          - entity: sensor.ev_charger_mobi_alm_00058_charger_last_session_end_reason
+            name: Previous session ended by
 
       # ---------------------------------------------------------------
       # Trends

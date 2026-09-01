@@ -53,6 +53,10 @@ impl MockCentralSystem {
                 let replies = replies_task.clone();
                 tokio::spawn(async move {
                     // Echo the subprotocol back, as a real OCPP server does.
+                    //
+                    // The Err type here is tungstenite's own `ErrorResponse`,
+                    // not ours to shrink, and this callback never returns one.
+                    #[allow(clippy::result_large_err)]
                     let ws = tokio_tungstenite::accept_hdr_async(
                         stream,
                         |req: &tokio_tungstenite::tungstenite::handshake::server::Request,

@@ -34,9 +34,9 @@ fn arb_json_value() -> impl Strategy<Value = Value> {
     prop_oneof![
         prop::string::string_regex("[a-zA-Z0-9 _\\-]{0,20}")
             .unwrap()
-            .prop_map(|s| Value::String(s)),
+            .prop_map(Value::String),
         (0i64..=9999i64).prop_map(|n| Value::Number(n.into())),
-        prop::bool::ANY.prop_map(|b| Value::Bool(b)),
+        prop::bool::ANY.prop_map(Value::Bool),
         Just(Value::Null),
     ]
 }
@@ -117,7 +117,7 @@ fn arb_ocpp_message() -> impl Strategy<Value = (Value, OcppMessageType)> {
 fn arb_timestamp() -> impl Strategy<Value = String> {
     // Generate a timestamp within a reasonable range
     (0i64..=2_000_000_000i64).prop_map(|secs| {
-        let dt = DateTime::from_timestamp(secs, 0).unwrap_or_else(|| Utc::now());
+        let dt = DateTime::from_timestamp(secs, 0).unwrap_or_else(Utc::now);
         dt.to_rfc3339()
     })
 }
