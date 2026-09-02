@@ -408,6 +408,25 @@ Create `/etc/ocpp-proxy/secrets.env` inside the container from
 `guest/secrets.env.example`, mode 600 owner `root:ocpp`, with the EMQX
 credentials. **Do not put them in `config.yaml`, and never commit them.**
 
+### EMQX accepts anonymous connections — deliberate, do not "fix"
+
+The broker on VM 110 accepts MQTT connections from the LAN with no credentials
+at all; a client that sends no username or password is let in. That is why the
+proxy connects while `/etc/ocpp-proxy/secrets.env` still holds the placeholder
+password from `secrets.env.example` — the credentials it sends are not being
+checked.
+
+This is an accepted risk, recorded 2026-09-02 at the owner's decision, not an
+unfinished step. Anything on the LAN can read the charger's OCPP traffic and
+publish to `ocpp/#`, including topics Home Assistant trusts. The exposure is
+bounded to the LAN: the broker is not reachable from the internet, and the
+charger's own link to Mobi.e does not pass through it.
+
+Do not enable EMQX authentication, and do not set a real password here, unless
+the owner asks. If that ever changes, both sides move together — an EMQX
+authentication source and the matching value in `secrets.env`; setting one
+without the other takes Home Assistant's charger dashboard offline.
+
 ```bash
 ssh proxmox 'pct exec 113 -- systemctl daemon-reload
              pct exec 113 -- systemctl enable --now ocpp-proxy'
