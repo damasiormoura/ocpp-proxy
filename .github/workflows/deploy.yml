@@ -30,6 +30,7 @@ concurrency:
 
 env:
   RUST_IMAGE: rust:1-bookworm
+  CACHE_ROOT: /home/runner/.cache/ocpp-proxy
   SSH_KEY: /home/runner/.ssh/deploy_ocpp_proxy
 
 jobs:
@@ -60,17 +61,23 @@ jobs:
       # this job installs a binary onto the thing that bills the electricity.
       - name: Test
         run: |
-          docker volume create ocpp-proxy-cargo >/dev/null
-          docker run --rm -v "$PWD:/w" -w /w \
-            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
-            "$RUST_IMAGE" cargo test --all-targets
+          mkdir -p "$CACHE_ROOT/cargo" "$CACHE_ROOT/target"
+          printf '%s\n' \
+            "FROM $RUST_IMAGE" \
+            "RUN rustup component add rustfmt clippy" \
+            | docker build -q -t ocpp-proxy-rust:local -
+          docker run --rm --user "$(id -u):$(id -g)" -e CARGO_HOME=/cargo \
+            -v "$PWD:/w" -w /w \
+            -v "$CACHE_ROOT/cargo:/cargo" -v "$CACHE_ROOT/target:/w/target" \
+            ocpp-proxy-rust:local cargo test --all-targets
 
       - name: Build release
         run: |
-          docker run --rm -v "$PWD:/w" -w /w \
-            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
-            "$RUST_IMAGE" cargo build --release
-          sha256sum target/release/ocpp-proxy | tee build.sha256
+          docker run --rm --user "$(id -u):$(id -g)" -e CARGO_HOME=/cargo \
+            -v "$PWD:/w" -w /w \
+            -v "$CACHE_ROOT/cargo:/cargo" -v "$CACHE_ROOT/target:/w/target" \
+            ocpp-proxy-rust:local cargo build --release
+          sha256sum "$CACHE_ROOT/target/release/ocpp-proxy" | tee build.sha256
 
       - name: Load targets
         run: |
@@ -109,7 +116,7 @@ jobs:
           SCP="scp -i $SSH_KEY -o BatchMode=yes -q"
           R=deploy/.rendered/deploy
 
-          $SCP target/release/ocpp-proxy            "$PROXMOX:/tmp/ocpp-proxy.new"
+          $SCP "$CACHE_ROOT/target/release/ocpp-proxy" "$PROXMOX:/tmp/ocpp-proxy.new"
           $SCP "$R/lxc/guest/config.yaml"           "$PROXMOX:/tmp/config.yaml"
           $SCP "$R/lxc/guest/ocpp-routes.service"   "$PROXMOX:/tmp/ocpp-routes.service"
           $SCP "$R/lxc/guest/ocpp-routes.sh"        "$PROXMOX:/tmp/ocpp-routes.sh"

@@ -21,6 +21,8 @@ env:
   # bookworm, not trixie: its glibc is older than the deployment target's, so a
   # binary built here runs there. The reverse would not hold.
   RUST_IMAGE: rust:1-bookworm
+  # Outside the workspace on purpose — checkout wipes the workspace every run.
+  CACHE_ROOT: /home/runner/.cache/ocpp-proxy
 
 jobs:
   build-and-test:
@@ -30,49 +32,67 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The official rust image uses rustup's minimal profile, so rustfmt and
-      # clippy are not in it and each step that needs one adds it.
-      # A named volume rather than actions/cache: the runner is self-hosted and
-      # persistent, so the registry and target directory survive between runs
-      # without a cache upload on every build.
-      - name: Prepare build cache
-        run: docker volume create ocpp-proxy-cargo >/dev/null
+      # The official rust image ships rustup's minimal profile — no rustfmt, no
+      # clippy — and runs as root, which left a root-owned target/ in the
+      # workspace that the next run's checkout could not delete (EACCES on
+      # target/CACHEDIR.TAG). Both are fixed here: the components are baked in
+      # once, and every cargo step runs as the runner's own uid with CARGO_HOME
+      # and target/ mounted from caches outside the workspace, so nothing
+      # root-owned is ever written into the checkout.
+
+      - name: Prepare build image and caches
+        run: |
+          mkdir -p "$CACHE_ROOT/cargo" "$CACHE_ROOT/target"
+          printf '%s\n' \
+            "FROM $RUST_IMAGE" \
+            "RUN rustup component add rustfmt clippy" \
+            | docker build -q -t ocpp-proxy-rust:local -
 
       - name: Format
         run: |
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/cargo \
             -v "$PWD:/w" -w /w \
-            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
-            "$RUST_IMAGE" sh -c 'rustup component add rustfmt >/dev/null 2>&1;
-                                 cargo fmt --check'
+            -v "$CACHE_ROOT/cargo:/cargo" \
+            -v "$CACHE_ROOT/target:/w/target" \
+            ocpp-proxy-rust:local cargo fmt --check
 
       - name: Clippy
         run: |
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/cargo \
             -v "$PWD:/w" -w /w \
-            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
-            "$RUST_IMAGE" sh -c 'rustup component add clippy >/dev/null 2>&1;
-                                 cargo clippy --all-targets -- -D warnings'
+            -v "$CACHE_ROOT/cargo:/cargo" \
+            -v "$CACHE_ROOT/target:/w/target" \
+            ocpp-proxy-rust:local cargo clippy --all-targets -- -D warnings
 
       - name: Test
         run: |
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/cargo \
             -v "$PWD:/w" -w /w \
-            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
-            "$RUST_IMAGE" cargo test --all-targets
+            -v "$CACHE_ROOT/cargo:/cargo" \
+            -v "$CACHE_ROOT/target:/w/target" \
+            ocpp-proxy-rust:local cargo test --all-targets
 
       - name: Release build
         run: |
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/cargo \
             -v "$PWD:/w" -w /w \
-            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
-            "$RUST_IMAGE" cargo build --release
-          sha256sum target/release/ocpp-proxy
-
+            -v "$CACHE_ROOT/cargo:/cargo" \
+            -v "$CACHE_ROOT/target:/w/target" \
+            ocpp-proxy-rust:local cargo build --release
+          sha256sum "$CACHE_ROOT/target/release/ocpp-proxy"
       # The Home Assistant templates have no compiler behind them and fail
       # silently — a template that raises takes its sensor `unavailable` rather
       # than logging anything obvious. This renders them against captured
       # payload shapes and asserts state and availability for each.
+
       - name: Home Assistant template checks
         run: |
           docker run --rm -v "$PWD:/w" -w /w python:3-slim sh -c \
@@ -83,6 +103,6 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: ocpp-proxy-${{ github.sha }}
-          path: target/release/ocpp-proxy
+          path: /home/runner/.cache/ocpp-proxy/target/release/ocpp-proxy
           retention-days: 14
           if-no-files-found: error
