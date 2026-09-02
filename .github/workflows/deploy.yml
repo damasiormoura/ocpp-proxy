@@ -1,0 +1,221 @@
+name: Deploy
+
+# Build, render and install the proxy onto its LXC, and the Home Assistant
+# package and dashboard onto the Home Assistant VM.
+#
+# Manual by default. A deploy restarts the proxy, and while it is down the
+# charger has no path to the Central System — with the APN SIM in the host's
+# dongle there is no second route. That is a two-second outage, but it is a real
+# one, so it does not happen on every merge without someone asking for it.
+#
+# Everything site-specific comes from the DEPLOY_LOCAL_ENV secret, which holds
+# the contents of deploy/local.env. Nothing identifying is in this repository —
+# see deploy/local.env.example for the parameter list.
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_open_transaction:
+        description: "Deploy even if a charging session is in progress"
+        type: boolean
+        default: false
+      skip_home_assistant:
+        description: "Deploy the proxy only, leave Home Assistant untouched"
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  RUST_IMAGE: rust:1-bookworm
+  SSH_KEY: /home/runner/.ssh/deploy_ocpp_proxy
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, ocpp-proxy]
+    timeout-minutes: 30
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write deployment parameters
+        env:
+          LOCAL_ENV: ${{ secrets.DEPLOY_LOCAL_ENV }}
+        run: |
+          if [ -z "$LOCAL_ENV" ]; then
+            echo "::error::DEPLOY_LOCAL_ENV secret is not set. It holds the" \
+                 "contents of deploy/local.env — see deploy/local.env.example."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$LOCAL_ENV" > deploy/local.env
+
+      - name: Render templates
+        run: ./deploy/render.sh
+
+      # Re-run here rather than trusting a green CI run on some other commit:
+      # this job installs a binary onto the thing that bills the electricity.
+      - name: Test
+        run: |
+          docker volume create ocpp-proxy-cargo >/dev/null
+          docker run --rm -v "$PWD:/w" -w /w \
+            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
+            "$RUST_IMAGE" cargo test --all-targets
+
+      - name: Build release
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
+            "$RUST_IMAGE" cargo build --release
+          sha256sum target/release/ocpp-proxy | tee build.sha256
+
+      - name: Load targets
+        run: |
+          set -a; . ./deploy/local.env; set +a
+          {
+            echo "PROXMOX=${PROXMOX_SSH_USER:-root}@${PROXMOX_HOST:?}"
+            echo "LXC_ID=${LXC_ID:?}"
+            echo "HA_VMID=${HA_VMID:?}"
+            echo "HA_CONFIG_DIR=${HA_CONFIG_DIR:?}"
+            echo "CHARGE_POINT_ID=${CHARGE_POINT_ID:?}"
+            echo "HEALTH_PORT=${HEALTH_PORT:-8080}"
+          } >> "$GITHUB_ENV"
+
+      - name: Pre-flight — is a charging session in progress?
+        run: |
+          SSH="ssh -i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=10 $PROXMOX"
+          state=$($SSH "pct exec $LXC_ID -- cat /var/lib/ocpp-proxy/state.json" 2>/dev/null || echo '{}')
+          echo "snapshot: $state"
+          # One line on purpose: a multi-line heredoc at column 0 would break
+          # the YAML block scalar this step is written in.
+          open=$(printf '%s' "$state" | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next((str(c["transaction_id"]) for c in m.values() if c.get("transaction_id") is not None), ""))' 2>/dev/null || true)
+          if [ -n "$open" ]; then
+            if [ "${{ inputs.allow_open_transaction }}" != "true" ]; then
+              echo "::error::Transaction $open is open. Restarting the proxy now" \
+                   "drops the charger's only path to the Central System mid-session." \
+                   "Re-run with allow_open_transaction if that is acceptable."
+              exit 1
+            fi
+            echo "::warning::Transaction $open is open; deploying anyway on request."
+          fi
+
+      - name: Deploy the proxy
+        run: |
+          set -euo pipefail
+          SSH="ssh -i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=10 $PROXMOX"
+          SCP="scp -i $SSH_KEY -o BatchMode=yes -q"
+          R=deploy/.rendered/deploy
+
+          $SCP target/release/ocpp-proxy            "$PROXMOX:/tmp/ocpp-proxy.new"
+          $SCP "$R/lxc/guest/config.yaml"           "$PROXMOX:/tmp/config.yaml"
+          $SCP "$R/lxc/guest/ocpp-routes.service"   "$PROXMOX:/tmp/ocpp-routes.service"
+          $SCP "$R/lxc/guest/ocpp-routes.sh"        "$PROXMOX:/tmp/ocpp-routes.sh"
+          $SCP deploy/lxc/guest/ocpp-proxy.service  "$PROXMOX:/tmp/ocpp-proxy.service"
+
+          # Stop first: a running binary cannot be overwritten ("Text file
+          # busy"), and a failed push followed by a restart silently reuses the
+          # old binary — which looks like a successful deploy that changed
+          # nothing.
+          $SSH "set -e
+            pct exec $LXC_ID -- systemctl stop ocpp-proxy
+            pct push $LXC_ID /tmp/ocpp-proxy.new       /usr/local/bin/ocpp-proxy --perms 755
+            pct push $LXC_ID /tmp/config.yaml          /etc/ocpp-proxy/config.yaml --perms 644
+            pct push $LXC_ID /tmp/ocpp-routes.service  /etc/systemd/system/ocpp-routes.service --perms 644
+            pct push $LXC_ID /tmp/ocpp-routes.sh       /usr/local/sbin/ocpp-routes.sh --perms 755
+            pct push $LXC_ID /tmp/ocpp-proxy.service   /etc/systemd/system/ocpp-proxy.service --perms 644
+            pct exec $LXC_ID -- systemctl daemon-reload
+            pct exec $LXC_ID -- systemctl start ocpp-proxy
+            rm -f /tmp/ocpp-proxy.new /tmp/config.yaml /tmp/ocpp-routes.service \
+                  /tmp/ocpp-routes.sh /tmp/ocpp-proxy.service"
+
+      - name: Verify the deployed binary is the one we built
+        run: |
+          SSH="ssh -i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=10 $PROXMOX"
+          want=$(cut -d' ' -f1 build.sha256)
+          got=$($SSH "pct exec $LXC_ID -- sha256sum /usr/local/bin/ocpp-proxy" | cut -d' ' -f1)
+          echo "built:    $want"
+          echo "deployed: $got"
+          [ "$want" = "$got" ] || { echo "::error::Deployed binary does not match the build."; exit 1; }
+
+      - name: Verify health
+        run: |
+          SSH="ssh -i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=10 $PROXMOX"
+          for i in $(seq 1 12); do
+            body=$($SSH "pct exec $LXC_ID -- python3 -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:$HEALTH_PORT/health', timeout=5).read().decode())\"" 2>/dev/null || true)
+            echo "attempt $i: ${body:-<no response>}"
+            case "$body" in
+              # `idle` is a pass: it means the listener is bound and serving,
+              # with no charger connected yet. The charger reconnects on its own
+              # within about 20 seconds, which is longer than this loop should
+              # block a deploy for.
+              *'"status":"healthy"'*|*'"status":"idle"'*|*'"status":"degraded"'*)
+                echo "proxy is serving"; exit 0 ;;
+            esac
+            sleep 5
+          done
+          echo "::error::Proxy did not report a serving state after restart."
+          $SSH "pct exec $LXC_ID -- journalctl -u ocpp-proxy -n 50 --no-pager" || true
+          exit 1
+
+      - name: Deploy the Home Assistant package and dashboard
+        if: ${{ inputs.skip_home_assistant != true }}
+        run: |
+          set -euo pipefail
+          SSH="ssh -i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=10 $PROXMOX"
+          R=deploy/.rendered/deploy/homeassistant
+
+          # Home Assistant OS has no SSH server of its own, so files go in
+          # through the QEMU guest agent. The agent takes a command line rather
+          # than a stream, so each file is base64'd and appended in chunks that
+          # fit one exec, then decoded on the far side.
+          push_file() {
+            local src="$1" dest="$2" b64 len i
+            b64=$(base64 -w0 "$src"); len=${#b64}
+            $SSH "qm guest exec $HA_VMID --timeout 30 -- /bin/sh -c 'rm -f /tmp/x.b64'" >/dev/null
+            for ((i=0; i<len; i+=3000)); do
+              $SSH "qm guest exec $HA_VMID --timeout 30 -- /bin/sh -c \"printf %s '${b64:$i:3000}' >> /tmp/x.b64\"" >/dev/null
+            done
+            $SSH "qm guest exec $HA_VMID --timeout 30 -- /bin/sh -c 'base64 -d /tmp/x.b64 > $dest && rm -f /tmp/x.b64 && sha256sum $dest'"
+          }
+
+          sha_of() {
+            $SSH "qm guest exec $HA_VMID --timeout 30 -- /bin/sh -c 'sha256sum $1 2>/dev/null || true'" || true
+          }
+
+          before=$(sha_of "$HA_CONFIG_DIR/packages/ocpp_proxy.yaml")
+          push_file "$R/ocpp_proxy.yaml" "$HA_CONFIG_DIR/packages/ocpp_proxy.yaml"
+          push_file "$R/dashboard.yaml"  "$HA_CONFIG_DIR/ev_charger_dashboard.yaml"
+
+          echo "--- validating Home Assistant configuration ---"
+          $SSH "qm guest exec $HA_VMID --timeout 240 -- /bin/sh -c 'ha core check'"
+
+          after=$(sha_of "$HA_CONFIG_DIR/packages/ocpp_proxy.yaml")
+          if [ "$before" = "$after" ]; then
+            echo "package unchanged — not restarting Home Assistant"
+          else
+            # Only the package needs a restart. The dashboard is a YAML-mode
+            # Lovelace file and is re-read on refresh.
+            echo "package changed — restarting Home Assistant"
+            $SSH "qm guest exec $HA_VMID --timeout 120 -- /bin/sh -c 'ha core restart'"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Binary | \`$(cut -d' ' -f1 build.sha256 2>/dev/null || echo n/a)\` |"
+            echo "| Target | LXC \`${LXC_ID:-?}\` on \`${PROXMOX:-?}\` |"
+            echo "| Home Assistant | ${{ inputs.skip_home_assistant == true && 'skipped' || 'deployed' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove deployment parameters from the workspace
+        if: always()
+        run: rm -f deploy/local.env

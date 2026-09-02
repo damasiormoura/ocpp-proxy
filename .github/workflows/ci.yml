@@ -1,0 +1,85 @@
+name: CI
+
+# Build, lint and test on every push and pull request.
+#
+# Runs on the self-hosted runner in LXC 106. That container has Docker but no
+# Rust toolchain, so the toolchain comes from a container image rather than
+# being installed into the runner — which also keeps the build reproducible and
+# leaves nothing to drift on the host.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # bookworm, not trixie: its glibc is older than the deployment target's, so a
+  # binary built here runs there. The reverse would not hold.
+  RUST_IMAGE: rust:1-bookworm
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, ocpp-proxy]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A named volume rather than actions/cache: the runner is self-hosted and
+      # persistent, so the registry and target directory survive between runs
+      # without a cache upload on every build.
+      - name: Prepare build cache
+        run: docker volume create ocpp-proxy-cargo >/dev/null
+
+      - name: Format
+        run: |
+          docker run --rm \
+            -v "$PWD:/w" -w /w \
+            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
+            "$RUST_IMAGE" cargo fmt --check
+
+      - name: Clippy
+        run: |
+          docker run --rm \
+            -v "$PWD:/w" -w /w \
+            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
+            "$RUST_IMAGE" sh -c 'rustup component add clippy >/dev/null 2>&1;
+                                 cargo clippy --all-targets -- -D warnings'
+
+      - name: Test
+        run: |
+          docker run --rm \
+            -v "$PWD:/w" -w /w \
+            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
+            "$RUST_IMAGE" cargo test --all-targets
+
+      - name: Release build
+        run: |
+          docker run --rm \
+            -v "$PWD:/w" -w /w \
+            -v ocpp-proxy-cargo:/usr/local/cargo/registry \
+            "$RUST_IMAGE" cargo build --release
+          sha256sum target/release/ocpp-proxy
+
+      # The Home Assistant templates have no compiler behind them and fail
+      # silently — a template that raises takes its sensor `unavailable` rather
+      # than logging anything obvious. This renders them against captured
+      # payload shapes and asserts state and availability for each.
+      - name: Home Assistant template checks
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w python:3-slim sh -c \
+            'pip install --quiet pyyaml jinja2 &&
+             python3 deploy/homeassistant/render_check.py'
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocpp-proxy-${{ github.sha }}
+          path: target/release/ocpp-proxy
+          retention-days: 14
+          if-no-files-found: error
