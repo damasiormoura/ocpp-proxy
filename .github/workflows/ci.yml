@@ -28,8 +28,10 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
+      # The official rust image uses rustup's minimal profile, so rustfmt and
+      # clippy are not in it and each step that needs one adds it.
       # A named volume rather than actions/cache: the runner is self-hosted and
       # persistent, so the registry and target directory survive between runs
       # without a cache upload on every build.
@@ -41,7 +43,8 @@ jobs:
           docker run --rm \
             -v "$PWD:/w" -w /w \
             -v ocpp-proxy-cargo:/usr/local/cargo/registry \
-            "$RUST_IMAGE" cargo fmt --check
+            "$RUST_IMAGE" sh -c 'rustup component add rustfmt >/dev/null 2>&1;
+                                 cargo fmt --check'
 
       - name: Clippy
         run: |
