@@ -80,7 +80,7 @@ jobs:
              python3 deploy/homeassistant/render_check.py'
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ocpp-proxy-${{ github.sha }}
           path: target/release/ocpp-proxy

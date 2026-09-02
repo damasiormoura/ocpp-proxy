@@ -31,8 +31,42 @@ you mean it.
 
 ## Setup — one time
 
-These three steps need repository-owner access and cannot be done from inside
-the repository.
+Two of the three are done. The third grants SSH access and is left to a human.
+
+| Step | State |
+|---|---|
+| Runner registered for this repository | **done** — `gha-runner-ocpp-proxy`, labels `self-hosted,ocpp-proxy`, service enabled |
+| `DEPLOY_LOCAL_ENV` secret | **done** |
+| Deploy key authorised on the Proxmox host | **outstanding — see below** |
+
+### Outstanding: authorise the deploy key
+
+The keypair exists on the runner at `/home/runner/.ssh/deploy_ocpp_proxy`, but
+its public half is not yet in the Proxmox host's `authorized_keys`, so the
+deploy job cannot reach the host. Until it is, `ci.yml` works and `deploy.yml`
+fails at its first `ssh`.
+
+Adding it grants shell access to the Proxmox host from the runner container,
+which is a privilege grant and deliberately not automated. Run it yourself:
+
+```bash
+PUB=$(ssh proxmox 'pct exec <RUNNER_LXC> -- cat /home/runner/.ssh/deploy_ocpp_proxy.pub')
+ssh proxmox "printf 'from=\"<RUNNER_LXC_IP>\" %s\n' '$PUB' >> /root/.ssh/authorized_keys"
+```
+
+The `from=` restriction confines the key to the runner container's address. The
+job needs a real shell there — it drives `pct` and `qm` — so a forced-command
+restriction would break it.
+
+Verify:
+
+```bash
+ssh proxmox 'pct exec <RUNNER_LXC> -- sudo -u runner \
+  ssh -i /home/runner/.ssh/deploy_ocpp_proxy -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      root@<PROXMOX_HOST> "pct exec <LXC_ID> -- systemctl is-active ocpp-proxy"'
+```
+
+### For reference — how the two completed steps were done
 
 ### 1. Register a runner for this repository
 
