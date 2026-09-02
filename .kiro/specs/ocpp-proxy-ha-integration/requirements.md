@@ -222,17 +222,17 @@ The Proxy is therefore designed to fail *closed and loudly* — it must make its
 
 **User Story:** As the operator, I want the constraints of the mobile path recorded, so that nobody later assumes it behaves like an ordinary internet connection.
 
-> Measured 2026-08-31 against the ZTE dongle with the SIM installed, operator NOS, LTE, `ppp_status: ppp_connected`, full signal.
+> Measured 2026-08-31 against the ZTE dongle with the SIM installed, the SIM operator, LTE, `ppp_status: ppp_connected`, full signal.
 
 #### Acceptance Criteria
 
 1. THE APN is a closed network. Generic internet egress is blocked: ICMP to `1.1.1.1` and TCP to public HTTP endpoints both fail while the modem reports a healthy connected session
 2. THE APN provides no usable DNS. The dongle offers no DNS server in its DHCP lease, does not proxy port 53 on its own gateway address, and public resolvers are unreachable over the path
-3. THE Central_System endpoint is `ws://10.200.10.200/ocpp/1.6/{Charge_Point_ID}`, with Charge_Point_ID `MOBI-ALM-00058`. It is a literal RFC1918 address, so the absence of DNS on the mobile path costs nothing and no resolver configuration is required
+3. THE Central_System endpoint is `$CENTRAL_SYSTEM_URL/{Charge_Point_ID}`, with Charge_Point_ID `$CHARGE_POINT_ID`. It is a literal RFC1918 address, so the absence of DNS on the mobile path costs nothing and no resolver configuration is required
 4. THE Central_System connection is plaintext `ws://` on port 80. The private APN is the entire security boundary between the Proxy and Mobi.e. This is the Charger's pre-existing arrangement and SHALL NOT be presented as introduced by this design; the Upstream_Connection consequently requires no TLS
-5. THE `10.200.10.0/24` range SHALL be routed over the WWAN_Link by destination route on both the Proxmox_Host and inside the Proxy_LXC. The range collides with no local network. This supersedes the source-address policy-routing scheme in Requirement 2 criterion 7, which is retained only as an optional measure should Mobi.e later move to a hostname or a wider range
+5. THE `$CENTRAL_SYSTEM_NETWORK` range SHALL be routed over the WWAN_Link by destination route on both the Proxmox_Host and inside the Proxy_LXC. The range collides with no local network. This supersedes the source-address policy-routing scheme in Requirement 2 criterion 7, which is retained only as an optional measure should Mobi.e later move to a hostname or a wider range
 6. THE absence of generic internet egress SHALL NOT be treated as a fault. It is the expected behaviour of a private APN and confirms the SIM is provisioned for Mobi.e traffic only
-7. Reachability of the WWAN_Link SHALL be tested by TCP connection to `10.200.10.200:80`, not against a public host. ICMP to the Central_System does work (measured at 79 ms), but an open TCP port additionally proves the Central_System is listening
+7. Reachability of the WWAN_Link SHALL be tested by TCP connection to `$CENTRAL_SYSTEM_HOST:80`, not against a public host. ICMP to the Central_System does work (measured at 79 ms), but an open TCP port additionally proves the Central_System is listening
 9. THE full path was verified 2026-08-31 from the Proxmox_Host: TCP open, `GET /` returning 200, and a WebSocket upgrade returning `101 Switching Protocols` from `nginx/1.6.2` with `ocpp1.6` negotiated
 10. A successful WebSocket upgrade SHALL NOT be read as confirmation that the Charge_Point_ID is registered. Controls established that the endpoint returns 101 for an invalid Charge_Point_ID and for a request with no subprotocol; authorization occurs above the handshake. Verifying registration requires an OCPP `BootNotification` exchange
 11. THE Central_System accepts any Charge_Point_ID over plaintext HTTP, so the private APN is the sole access control on this path. Nothing SHALL bridge the WWAN_Link to a general-purpose network

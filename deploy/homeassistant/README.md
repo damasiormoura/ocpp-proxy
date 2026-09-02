@@ -27,32 +27,32 @@ broker configuration is needed.
 
 | Entity | Source topic | Notes |
 |---|---|---|
-| `sensor.ev_charger_mobi_alm_00058_charger_power` | `charger/MeterValues` | W, `measurement` |
-| `sensor.ev_charger_mobi_alm_00058_charger_energy_meter` | `charger/MeterValues` | kWh lifetime, `total_increasing` |
-| `sensor.ev_charger_mobi_alm_00058_charger_current_l1` | `charger/MeterValues` | A |
-| `sensor.ev_charger_mobi_alm_00058_charger_voltage_l1` | `charger/MeterValues` | V |
-| `sensor.ev_charger_mobi_alm_00058_charger_status` | `charger/StatusNotification` | Available / Preparing / Charging / … |
-| `sensor.ev_charger_mobi_alm_00058_charger_error_code` | `charger/StatusNotification` | `NoError` when healthy |
-| `sensor.ev_charger_mobi_alm_00058_charger_transaction_id` | `central_system/StartTransaction` | assigned by Mobi.e |
-| `sensor.ev_charger_mobi_alm_00058_charger_authorization` | `central_system/Authorize` | Accepted / Blocked / Invalid |
-| `sensor.ev_charger_mobi_alm_00058_charger_session_meter_start` | `charger/StartTransaction` | kWh at transaction open |
-| `sensor.ev_charger_mobi_alm_00058_charger_last_session_energy` | `state` | kWh on the register at transaction close |
-| `sensor.ev_charger_mobi_alm_00058_charger_last_session_delivered` | `state` | kWh the last session actually delivered |
-| `sensor.ev_charger_mobi_alm_00058_charger_last_session_end_reason` | `state` | `EVDisconnected`, `Local`, `Remote`, … |
+| `sensor.${CHARGE_POINT_SLUG}_charger_power` | `charger/MeterValues` | W, `measurement` |
+| `sensor.${CHARGE_POINT_SLUG}_charger_energy_meter` | `charger/MeterValues` | kWh lifetime, `total_increasing` |
+| `sensor.${CHARGE_POINT_SLUG}_charger_current_l1` | `charger/MeterValues` | A |
+| `sensor.${CHARGE_POINT_SLUG}_charger_voltage_l1` | `charger/MeterValues` | V |
+| `sensor.${CHARGE_POINT_SLUG}_charger_status` | `charger/StatusNotification` | Available / Preparing / Charging / … |
+| `sensor.${CHARGE_POINT_SLUG}_charger_error_code` | `charger/StatusNotification` | `NoError` when healthy |
+| `sensor.${CHARGE_POINT_SLUG}_charger_transaction_id` | `central_system/StartTransaction` | assigned by Mobi.e |
+| `sensor.${CHARGE_POINT_SLUG}_charger_authorization` | `central_system/Authorize` | Accepted / Blocked / Invalid |
+| `sensor.${CHARGE_POINT_SLUG}_charger_session_meter_start` | `charger/StartTransaction` | kWh at transaction open |
+| `sensor.${CHARGE_POINT_SLUG}_charger_last_session_energy` | `state` | kWh on the register at transaction close |
+| `sensor.${CHARGE_POINT_SLUG}_charger_last_session_delivered` | `state` | kWh the last session actually delivered |
+| `sensor.${CHARGE_POINT_SLUG}_charger_last_session_end_reason` | `state` | `EVDisconnected`, `Local`, `Remote`, … |
 | `sensor.charger_session_energy` | template | energy delivered this session |
-| `sensor.ev_charger_mobi_alm_00058_ocpp_proxy_upstream` / `_downstream` | `status` | retained |
-| `binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online` | `availability` | driven by the MQTT Last Will |
+| `sensor.${CHARGE_POINT_SLUG}_ocpp_proxy_upstream` / `_downstream` | `status` | retained |
+| `binary_sensor.${CHARGE_POINT_SLUG}_ocpp_proxy_online` | `availability` | driven by the MQTT Last Will |
 
 ## Energy dashboard
 
-`sensor.ev_charger_mobi_alm_00058_charger_energy_meter` is `device_class: energy` with
+`sensor.${CHARGE_POINT_SLUG}_charger_energy_meter` is `device_class: energy` with
 `state_class: total_increasing`, so it can be added directly under
 Settings → Dashboards → Energy → *Individual devices*. Home Assistant derives
 daily and monthly totals from it; nothing extra is needed.
 
 ## Alert on the proxy going offline
 
-`binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online` is the **only** thing that tells you the
+`binary_sensor.${CHARGE_POINT_SLUG}_ocpp_proxy_online` is the **only** thing that tells you the
 proxy has died. Nothing else watches that process, and with the APN SIM in the
 dongle the proxy is the charger's sole route to Mobi.e — if it stops, charging
 and billing stop with it. Worth an automation:
@@ -62,7 +62,7 @@ automation:
   - alias: "OCPP proxy offline"
     triggers:
       - trigger: state
-        entity_id: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
+        entity_id: binary_sensor.${CHARGE_POINT_SLUG}_ocpp_proxy_online
         to: "off"
         for: "00:02:00"
     actions:

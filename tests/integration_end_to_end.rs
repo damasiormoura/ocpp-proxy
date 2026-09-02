@@ -27,7 +27,7 @@ use ocpp_proxy::models::Direction;
 use ocpp_proxy::session::SessionConfig;
 use ocpp_proxy::state::ConnectionStateManager;
 
-const CHARGE_POINT_ID: &str = "MOBI-ALM-00058";
+const CHARGE_POINT_ID: &str = "CP-EXAMPLE-0001";
 
 /// A stand-in for the Mobi.e Central System.
 struct MockCentralSystem {

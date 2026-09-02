@@ -17,7 +17,7 @@ views:
       # ---------------------------------------------------------------
       - type: conditional
         conditions:
-          - entity: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
+          - entity: binary_sensor.@CHARGE_POINT_SLUG@_ocpp_proxy_online
             state: "off"
         card:
           type: markdown
@@ -37,18 +37,18 @@ views:
       # restarted, because that topic is not retained.
       - type: conditional
         conditions:
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_error_code
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_error_code
             state_not: "NoError"
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_error_code
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_error_code
             state_not: "unknown"
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_error_code
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_error_code
             state_not: "unavailable"
         card:
           type: markdown
           content: >
-            ## ⚠️ Charger reports {{ states('sensor.ev_charger_mobi_alm_00058_charger_error_code') }}
+            ## ⚠️ Charger reports {{ states('sensor.@CHARGE_POINT_SLUG@_charger_error_code') }}
 
-            Status: {{ states('sensor.ev_charger_mobi_alm_00058_charger_status') }}
+            Status: {{ states('sensor.@CHARGE_POINT_SLUG@_charger_status') }}
 
       # ---------------------------------------------------------------
       # At a glance
@@ -57,13 +57,13 @@ views:
         title: Status
         columns: 4
         entities:
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_status
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_status
             name: Charger
-          - entity: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
+          - entity: binary_sensor.@CHARGE_POINT_SLUG@_ocpp_proxy_online
             name: Proxy
-          - entity: sensor.ev_charger_mobi_alm_00058_ocpp_proxy_upstream
+          - entity: sensor.@CHARGE_POINT_SLUG@_ocpp_proxy_upstream
             name: Mobi.e
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_transaction_id
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_transaction_id
             name: Transaction
 
       # ---------------------------------------------------------------
@@ -79,15 +79,15 @@ views:
       # being down, which the banner at the top already reports.
       - type: conditional
         conditions:
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_power
             state_not: "unknown"
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_power
             state_not: "unavailable"
         card:
           type: horizontal-stack
           cards:
             - type: gauge
-              entity: sensor.ev_charger_mobi_alm_00058_charger_power
+              entity: sensor.@CHARGE_POINT_SLUG@_charger_power
               name: Power
               unit: W
               min: 0
@@ -97,7 +97,7 @@ views:
                 yellow: 7000
                 red: 7300
             - type: gauge
-              entity: sensor.ev_charger_mobi_alm_00058_charger_current_l1
+              entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
               name: Current L1
               unit: A
               min: 0
@@ -111,7 +111,7 @@ views:
       # space does not just go blank.
       - type: conditional
         conditions:
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_power
             state: "unknown"
         card:
           type: markdown
@@ -126,24 +126,24 @@ views:
           - entity: sensor.charger_session_energy
             name: Energy delivered
             icon: mdi:lightning-bolt
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_session_meter_start
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_session_meter_start
             name: Meter at start
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_energy_meter
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_energy_meter
             name: Meter now
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_transaction_id
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_transaction_id
             name: Transaction ID
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_authorization
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_authorization
             name: Last authorisation
           - type: divider
           # These three come from the retained snapshot, so they are populated
           # the moment Home Assistant subscribes rather than staying blank
           # until the next session ends.
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_last_session_delivered
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_last_session_delivered
             name: Previous session delivered
             icon: mdi:battery-charging
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_last_session_energy
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_last_session_energy
             name: Previous session meter stop
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_last_session_end_reason
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_last_session_end_reason
             name: Previous session ended by
 
       # ---------------------------------------------------------------
@@ -153,16 +153,16 @@ views:
         title: Power (last 6 hours)
         hours_to_show: 6
         entities:
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_power
             name: Power
 
       - type: history-graph
         title: Charger state
         hours_to_show: 24
         entities:
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_status
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_status
             name: Status
-          - entity: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
+          - entity: binary_sensor.@CHARGE_POINT_SLUG@_ocpp_proxy_online
             name: Proxy online
 
       - type: statistics-graph
@@ -173,7 +173,7 @@ views:
         stat_types:
           - change
         entities:
-          - sensor.ev_charger_mobi_alm_00058_charger_energy_meter
+          - sensor.@CHARGE_POINT_SLUG@_charger_energy_meter
 
       # ---------------------------------------------------------------
       # Electrical detail — collapsed by default, rarely needed
@@ -181,21 +181,21 @@ views:
       - type: entities
         title: Electrical
         entities:
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_voltage_l1
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_voltage_l1
             name: Voltage L1
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_current_l1
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
             name: Current L1
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_power
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_power
             name: Active power
 
       - type: entities
         title: Proxy link
         entities:
-          - entity: binary_sensor.ev_charger_mobi_alm_00058_ocpp_proxy_online
+          - entity: binary_sensor.@CHARGE_POINT_SLUG@_ocpp_proxy_online
             name: Proxy process
-          - entity: sensor.ev_charger_mobi_alm_00058_ocpp_proxy_upstream
+          - entity: sensor.@CHARGE_POINT_SLUG@_ocpp_proxy_upstream
             name: Upstream to Mobi.e
-          - entity: sensor.ev_charger_mobi_alm_00058_ocpp_proxy_downstream
+          - entity: sensor.@CHARGE_POINT_SLUG@_ocpp_proxy_downstream
             name: Downstream to charger
-          - entity: sensor.ev_charger_mobi_alm_00058_charger_error_code
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_error_code
             name: Charger error code

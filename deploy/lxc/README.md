@@ -41,8 +41,8 @@ config files:
 
 | Item | Status |
 |---|---|
-| Dongle subnet and gateway | **Resolved 2026-08-31.** `192.168.0.0/24`, gateway `192.168.0.1`, DHCP offers `.169`. Modem reports LTE, full signal, `ppp_connected`, operator NOS. Confirm the DHCP pool range in the dongle UI and move the static address outside it if `.169` falls inside. |
-| Mobi.e endpoint | **Resolved.** `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058`, read from the charger's own OCPP configuration. Charge Point ID `MOBI-ALM-00058`; the proxy is configured with the base `ws://10.200.10.200/ocpp/1.6` and appends the ID. |
+| Dongle subnet and gateway | **Resolved 2026-08-31.** `$WWAN_NETWORK`, gateway `$WWAN_GATEWAY`, DHCP offers `.169`. Modem reports LTE, full signal, `ppp_connected`, the SIM operator. Confirm the DHCP pool range in the dongle UI and move the static address outside it if `.169` falls inside. |
+| Mobi.e endpoint | **Resolved.** ``$CENTRAL_SYSTEM_URL`/`$CHARGE_POINT_ID``, read from the charger's own OCPP configuration. Charge Point ID `$CHARGE_POINT_ID`; the proxy is configured with the base `$CENTRAL_SYSTEM_URL` and appends the ID. |
 | Charger address | **Found: `192.168.51.59`** — see below. |
 
 ### Charger: identified 2026-08-31
@@ -59,8 +59,8 @@ subject = C=CN, ST=Guangdong Sheng,
 
 | Interface | MAC | State |
 |---|---|---|
-| ESP32 WiFi / comms module | `0c:dc:7e:57:7f:0c` (Espressif, hostname `espressif`) | **active**, holds `192.168.51.59` |
-| Ethernet | `18:d7:93:60:b6:19` | **down** — absent from both networks at every layer |
+| ESP32 WiFi / comms module | `<charger-wifi-mac>` (Espressif, hostname `espressif`) | **active**, holds `192.168.51.59` |
+| Ethernet | `<charger-ethernet-mac>` | **down** — absent from both networks at every layer |
 
 Searching for the Ethernet MAC finds nothing anywhere, which is correct and not
 a fault: that port is simply unused. The charger is on the network via WiFi,
@@ -68,7 +68,7 @@ associated to the TL-WPA4220's own SSID rather than to the spare BD4 — it does
 not appear in any of the spare router's `wlanconfig` station lists, and arrives
 from the powerline uplink port.
 
-It currently has **no flows to `10.200.10.200`**, as expected: its configured
+It currently has **no flows to `$CENTRAL_SYSTEM_HOST`**, as expected: its configured
 Central System is only reachable over the APN, and the SIM is now in the
 dongle. It maintains a TLS session to Autel's cloud instead.
 
@@ -87,7 +87,7 @@ WiFi hop is, roughly 9× slower and 12× more jittery than anything else, which
 is what an ESP32 module with WiFi power-saving on a second wireless hop looks
 like.
 
-**Recommendation: use the Ethernet port.** Plugging `18:d7:93:60:b6:19` into a
+**Recommendation: use the Ethernet port.** Plugging `<charger-ethernet-mac>` into a
 TL-WPA4220 LAN port moves the charger onto the wired side of the powerline and
 should bring it to roughly the WPA4220's own 7 ms. That matters more than
 ordinary tuning here, because this link sits on the charger's only path to
@@ -102,11 +102,11 @@ charging-critical path that NIC is now worth more than it was when
 
 ### Still to do on the charger
 
-- **DHCP reservation on the spare BD4** for `0c:dc:7e:57:7f:0c` — `.59` is
+- **DHCP reservation on the spare BD4** for `<charger-wifi-mac>` — `.59` is
   currently an ordinary lease, and Requirement 12.4 needs it stable before it
   can be named in firewall rules
 - **Capture its remaining OCPP settings** for the Requirement 11.13 bypass
-- **Repoint it** at `ws://192.168.52.30:9000/MOBI-ALM-00058` once the proxy runs
+- **Repoint it** at `ws://192.168.52.30:9000/$CHARGE_POINT_ID` once the proxy runs
 
 The path is verified working ahead of the charger's arrival — from the IoT
 segment, `192.168.52.1` and HA at `192.168.52.144` both answer in 2–4 ms,
@@ -118,12 +118,12 @@ Verified 2026-08-31 while the modem reported a healthy connected LTE session:
 
 | Test | Result |
 |---|---|
-| Dongle gateway `192.168.0.1` | reachable, 0.8 ms |
+| Dongle gateway `$WWAN_GATEWAY` | reachable, 0.8 ms |
 | ICMP to `1.1.1.1` | 100% loss |
 | TCP to `http://example.com` | no connection |
-| ICMP to `10.200.10.200` | **works, 79 ms** — inside the garden ICMP is fine |
-| TCP to `10.200.10.200:80` | **open** |
-| DNS to `192.168.0.1:53` | timeout — the dongle does not proxy DNS |
+| ICMP to `$CENTRAL_SYSTEM_HOST` | **works, 79 ms** — inside the garden ICMP is fine |
+| TCP to `$CENTRAL_SYSTEM_HOST:80` | **open** |
+| DNS to `$WWAN_GATEWAY:53` | timeout — the dongle does not proxy DNS |
 | DNS to `8.8.8.8` | timeout |
 | DNS server in the DHCP lease | none offered |
 
@@ -131,11 +131,11 @@ This is a private APN behaving correctly, **not a fault**. Two consequences
 that shape the deployment:
 
 1. **The DNS gap costs nothing.** The Central System turned out to be a literal
-   private address, `10.200.10.200`, so there is nothing to resolve. Had it
+   private address, `$CENTRAL_SYSTEM_HOST`, so there is nothing to resolve. Had it
    been a hostname, the absence of DNS on this path would have been a problem.
 2. **Never health-check the WWAN path against a public host.** No public host
    is reachable. ICMP *does* work to Mobi.e itself, but the watchdog makes a
-   TCP connection to `10.200.10.200:80` because an open port proves the Central
+   TCP connection to `$CENTRAL_SYSTEM_HOST:80` because an open port proves the Central
    System is listening where a ping only proves the host answers. Set
    `PROBE_HOST` and `PROBE_PORT` in `/etc/default/ocpp-wwan`.
 3. **Nothing is encrypted between the proxy and Mobi.e.** The endpoint is
@@ -150,8 +150,8 @@ plain destination route is enough and no policy rules or routing tables are
 involved:
 
 ```
-host:      ip route add 10.200.10.0/24 via 192.168.0.1  dev wwan0
-container: ip route add 10.200.10.0/24 via 10.80.0.1    dev eth1
+host:      ip route add $CENTRAL_SYSTEM_NETWORK via $WWAN_GATEWAY  dev wwan0
+container: ip route add $CENTRAL_SYSTEM_NETWORK via 10.80.0.1    dev eth1
 ```
 
 This replaces the earlier source-address policy-routing scheme. It is simpler,
@@ -210,8 +210,8 @@ Then prove the endpoint itself is reachable. TCP, not ping — this APN drops
 ICMP even when it is working:
 
 ```bash
-ssh proxmox 'ip route get 10.200.10.200'                       # expect dev wwan0
-ssh proxmox 'timeout 8 bash -c "</dev/tcp/10.200.10.200/80" && echo REACHABLE'
+ssh proxmox 'ip route get $CENTRAL_SYSTEM_HOST'                       # expect dev wwan0
+ssh proxmox 'timeout 8 bash -c "</dev/tcp/$CENTRAL_SYSTEM_HOST/80" && echo REACHABLE'
 ```
 
 For a full protocol-level check, a WebSocket upgrade should return
@@ -223,7 +223,7 @@ ssh proxmox 'curl -i --http1.1 -m 10 \
   -H "Sec-WebSocket-Version: 13" \
   -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
   -H "Sec-WebSocket-Protocol: ocpp1.6" \
-  http://10.200.10.200/ocpp/1.6/MOBI-ALM-00058'
+  $CENTRAL_SYSTEM_URL (http scheme)/$CHARGE_POINT_ID'
 ```
 
 **Verified 2026-08-31 from the Proxmox host** — the full path works:
@@ -243,7 +243,7 @@ System waits for the charge point to speak first.
 > the same endpoint: omitting the subprotocol still returned 101, and a
 > deliberately invalid Charge Point ID (`MOBI-DOES-NOT-EXIST`) *also* returned
 > 101 with `ocpp1.6` negotiated. The nginx front end upgrades any path.
-> Confirming that Mobi.e accepts `MOBI-ALM-00058` requires an actual OCPP
+> Confirming that Mobi.e accepts `$CHARGE_POINT_ID` requires an actual OCPP
 > `BootNotification` and reading the response status — which writes to the
 > operator's system and should be done deliberately, not as a routine check.
 
@@ -261,8 +261,8 @@ line rather than by DHCP.
 > **Steps 1–3 were installed and verified on the host 2026-08-31.** `wwan0` is
 > pinned and holds its name (`10-wwan.link` confirmed applied by
 > `udevadm test-builtin net_setup_link`), the LAN default route remains the
-> only default route, `10.200.10.0/24` egresses `wwan0`, NAT and MSS clamp are
-> in place, and TCP to `10.200.10.200:80` succeeds from the host. The watchdog
+> only default route, `$CENTRAL_SYSTEM_NETWORK` egresses `wwan0`, NAT and MSS clamp are
+> in place, and TCP to `$CENTRAL_SYSTEM_HOST:80` succeeds from the host. The watchdog
 > timer is enabled, silent when healthy, and was tested by deleting the Mobi.e
 > route and the NAT rule — it logged both and restored them.
 
@@ -271,7 +271,7 @@ scp host/wwan-watchdog.sh            proxmox:/usr/local/sbin/
 scp host/ocpp-wwan-watchdog.service  proxmox:/etc/systemd/system/
 scp host/ocpp-wwan-watchdog.timer    proxmox:/etc/systemd/system/
 ssh proxmox 'chmod 750 /usr/local/sbin/wwan-watchdog.sh'
-ssh proxmox 'printf "WWAN_GW=192.168.0.1\nPROBE_HOST=10.200.10.200\nPROBE_PORT=80\n" > /etc/default/ocpp-wwan'
+ssh proxmox 'printf "WWAN_GW=$WWAN_GATEWAY\nPROBE_HOST=$CENTRAL_SYSTEM_HOST\nPROBE_PORT=80\n" > /etc/default/ocpp-wwan'
 ssh proxmox 'systemctl daemon-reload && systemctl enable --now ocpp-wwan-watchdog.timer'
 ```
 
@@ -478,9 +478,9 @@ forever whenever nobody was charging.
 | Charger listener | bound to `192.168.52.30:9000` only |
 | Non-`ocpp1.6` subprotocol | HTTP 400 |
 | Simulated charger connects | `101 Switching Protocols`, `ocpp1.6` negotiated |
-| Upstream established through the APN | `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058` in **284 ms** |
+| Upstream established through the APN | ``$CENTRAL_SYSTEM_URL`/`$CHARGE_POINT_ID`` in **284 ms** |
 | `/health` with a charger attached | `{"status":"healthy","upstream":"connected","mqtt":"connected"}` |
-| MQTT retained topics | `ocpp/MOBI-ALM-00058/availability` = `online`, `.../status` tracking both legs |
+| MQTT retained topics | `ocpp/$CHARGE_POINT_ID/availability` = `online`, `.../status` tracking both legs |
 | `kill -9` the process | systemd restarted it, `NRestarts=1` |
 | Container reboot | routes, proxy, MQTT and the full chain all return unattended |
 | Proxy stopped | Last Will published `availability` = `offline` |

@@ -284,7 +284,7 @@ APN uplink. Tasks 15–17 depend on the fixes in 10.3, 10.4, 11.1 and 13.1.
 - [ ] 15. Adapt the application to the new deployment
   - [x] 15.1 Add `listen_address` configuration
     - Bind the charger listener to `listen_address` (default `0.0.0.0`); set to the LXC's `vmbr1` address so the listener is not exposed on the WWAN-egress or main-LAN legs
-    - `upstream_bind_address` is **no longer required**: Mobi.e is a fixed RFC1918 range (`10.200.10.0/24`), so egress is selected by destination route on the host and in the container. Keep the parameter optional for a possible future move to a hostname
+    - `upstream_bind_address` is **no longer required**: Mobi.e is a fixed RFC1918 range (`$CENTRAL_SYSTEM_NETWORK`), so egress is selected by destination route on the host and in the container. Keep the parameter optional for a possible future move to a hostname
     - _Requirements: 7.4, 13.5_
   - [x] 15.2 Make MQTT TLS optional
     - `ca_cert_path`, `client_cert_path`, `client_key_path` become `Option<String>`
@@ -320,19 +320,19 @@ APN uplink. Tasks 15–17 depend on the fixes in 10.3, 10.4, 11.1 and 13.1.
 
 - [ ] 19. Host and network provisioning (`deploy/lxc/README.md`)
   - [ ] 19.1 Pin the dongle to `wwan0` by USB ID before inserting the SIM — the MAC-derived `enx*` name will change once a SIM registers
-  - [x] 19.2 Insert SIM and record the dongle's subnet and gateway — `192.168.0.0/24` via `192.168.0.1`, LTE, full signal, `ppp_connected`, operator NOS
-  - [ ] 19.3 Apply host networking: `vmbr2`, `wwan0` static with no default route, `10.200.10.0/24` destination route, MASQUERADE, MSS clamp
+  - [x] 19.2 Insert SIM and record the dongle's subnet and gateway — `$WWAN_NETWORK` via `$WWAN_GATEWAY`, LTE, full signal, `ppp_connected`, the SIM operator
+  - [ ] 19.3 Apply host networking: `vmbr2`, `wwan0` static with no default route, `$CENTRAL_SYSTEM_NETWORK` destination route, MASQUERADE, MSS clamp
   - [ ] 19.4 Install the WWAN watchdog timer
   - [ ] 19.5 Create LXC 113, update `network/addressing.md` and `proxmox/inventory.md` in the mouraishikawa repo
   - [ ] 19.6 Give the charger a DHCP reservation and apply the Proxmox firewall rules on LXC 113
-  - [x] 19.7 **Record the charger's original Mobi.e URL** — `ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058`. Still to capture: the rest of the charger's OCPP settings, for the Requirement 11.13 bypass
+  - [x] 19.7 **Record the charger's original Mobi.e URL** — ``$CENTRAL_SYSTEM_URL`/`$CHARGE_POINT_ID``. Still to capture: the rest of the charger's OCPP settings, for the Requirement 11.13 bypass
   - [x] 19.8 DNS question resolved — the endpoint is a literal IP, so no resolver configuration is needed on the APN path
   - [x] 19.9 Verify the endpoint over the APN — **done 2026-08-31 from the Proxmox host.** TCP open, ICMP 79 ms, `GET /` 200, WebSocket upgrade returned `101` from `nginx/1.6.2` with `ocpp1.6` negotiated
-  - [ ] 19.11 Confirm Mobi.e actually accepts `MOBI-ALM-00058` — the 101 does not establish this. Controls returned 101 for an invalid Charge Point ID and for a request with no subprotocol, so the front end upgrades any path. Requires sending a real `BootNotification` and reading the response status, which writes to the operator's system
-  - [x] 19.10 Charger located at `192.168.51.59`, confirmed by the Autel TLS certificate on its cloud session. Two MACs: `0c:dc:7e:57:7f:0c` (ESP32 WiFi, active) and `18:d7:93:60:b6:19` (Ethernet, down) — searching for the latter finds nothing because the port is unused
-  - [ ] 19.12 DHCP reservation on the spare BD4 for `0c:dc:7e:57:7f:0c`, so the address is stable enough to name in firewall rules
-  - [ ] 19.14 Move the charger to Ethernet. Its WiFi hop measures 65.8 ms avg / ±31.7 jitter / 125 ms max, against 6.9 ms / ±1.3 for the wired-behind-powerline TL-WPA4220. Plugging `18:d7:93:60:b6:19` into a WPA4220 LAN port removes a wireless hop from the charger's only path to Mobi.e
-  - [ ] 19.15 Repoint the charger at `ws://192.168.52.30:9000/MOBI-ALM-00058` once the proxy is running
+  - [ ] 19.11 Confirm Mobi.e actually accepts `$CHARGE_POINT_ID` — the 101 does not establish this. Controls returned 101 for an invalid Charge Point ID and for a request with no subprotocol, so the front end upgrades any path. Requires sending a real `BootNotification` and reading the response status, which writes to the operator's system
+  - [x] 19.10 Charger located at `192.168.51.59`, confirmed by the Autel TLS certificate on its cloud session. Two MACs: `<charger-wifi-mac>` (ESP32 WiFi, active) and `<charger-ethernet-mac>` (Ethernet, down) — searching for the latter finds nothing because the port is unused
+  - [ ] 19.12 DHCP reservation on the spare BD4 for `<charger-wifi-mac>`, so the address is stable enough to name in firewall rules
+  - [ ] 19.14 Move the charger to Ethernet. Its WiFi hop measures 65.8 ms avg / ±31.7 jitter / 125 ms max, against 6.9 ms / ±1.3 for the wired-behind-powerline TL-WPA4220. Plugging `<charger-ethernet-mac>` into a WPA4220 LAN port removes a wireless hop from the charger's only path to Mobi.e
+  - [ ] 19.15 Repoint the charger at `ws://192.168.52.30:9000/$CHARGE_POINT_ID` once the proxy is running
   - [x] 19.13 Verify the charger-to-proxy path ahead of time — from the IoT segment, `192.168.52.1` answers in 2-4 ms via the spare router's static route and the host's forwarding
 
 - [ ] 14. Final checkpoint - Ensure all tests pass

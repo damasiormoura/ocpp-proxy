@@ -23,7 +23,7 @@
 #
 # Entity IDs: because these sensors declare a `device:`, Home Assistant builds
 # each entity_id from the device name plus the sensor name, giving
-# `sensor.ev_charger_mobi_alm_00058_charger_power` rather than
+# `sensor.@CHARGE_POINT_SLUG@_charger_power` rather than
 # `sensor.charger_power`. The template sensors and the dashboard reference the
 # full IDs accordingly. Renaming them afterwards in the UI does not change the
 # unique_id, so the dashboard would need updating to match if you do.
@@ -36,7 +36,7 @@ mqtt:
   sensor:
     - name: "Charger Power"
       unique_id: ocpp_charger_power
-      state_topic: "ocpp/MOBI-ALM-00058/charger/MeterValues"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/charger/MeterValues"
       device_class: power
       state_class: measurement
       unit_of_measurement: "W"
@@ -52,12 +52,12 @@ mqtt:
              | map(attribute='value') | list %}
         {{ (vals[0] | float(0)) | round(0) | int if vals else 0 }}
       availability: &proxy_availability
-        - topic: "ocpp/MOBI-ALM-00058/availability"
+        - topic: "ocpp/@CHARGE_POINT_ID@/availability"
           payload_available: "online"
           payload_not_available: "offline"
       device: &charger_device
-        identifiers: ["ocpp_proxy_MOBI-ALM-00058"]
-        name: "EV Charger (MOBI-ALM-00058)"
+        identifiers: ["ocpp_proxy_@CHARGE_POINT_ID@"]
+        name: "EV Charger (@CHARGE_POINT_ID@)"
         manufacturer: "Autel"
         model: "MaxiCharger via OCPP proxy"
 
@@ -65,7 +65,7 @@ mqtt:
     # by the Home Assistant Energy dashboard directly.
     - name: "Charger Energy Meter"
       unique_id: ocpp_charger_energy_meter
-      state_topic: "ocpp/MOBI-ALM-00058/charger/MeterValues"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/charger/MeterValues"
       device_class: energy
       state_class: total_increasing
       unit_of_measurement: "kWh"
@@ -81,7 +81,7 @@ mqtt:
 
     - name: "Charger Current L1"
       unique_id: ocpp_charger_current_l1
-      state_topic: "ocpp/MOBI-ALM-00058/charger/MeterValues"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/charger/MeterValues"
       device_class: current
       state_class: measurement
       unit_of_measurement: "A"
@@ -99,7 +99,7 @@ mqtt:
 
     - name: "Charger Voltage L1"
       unique_id: ocpp_charger_voltage_l1
-      state_topic: "ocpp/MOBI-ALM-00058/charger/MeterValues"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/charger/MeterValues"
       device_class: voltage
       state_class: measurement
       unit_of_measurement: "V"
@@ -125,18 +125,18 @@ mqtt:
     # is delivered the instant HA subscribes.
     - name: "Charger Status"
       unique_id: ocpp_charger_status
-      state_topic: "ocpp/MOBI-ALM-00058/state"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
       icon: mdi:ev-station
       # Available / Preparing / Charging / SuspendedEV / SuspendedEVSE /
       # Finishing / Reserved / Unavailable / Faulted
       value_template: "{{ value_json.connector_status | default('Unknown', true) }}"
-      json_attributes_topic: "ocpp/MOBI-ALM-00058/state"
+      json_attributes_topic: "ocpp/@CHARGE_POINT_ID@/state"
       availability: *proxy_availability
       device: *charger_device
 
     - name: "Charger Error Code"
       unique_id: ocpp_charger_error_code
-      state_topic: "ocpp/MOBI-ALM-00058/state"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
       icon: mdi:alert-circle-outline
       value_template: "{{ value_json.error_code | default('NoError', true) }}"
       availability: *proxy_availability
@@ -150,7 +150,7 @@ mqtt:
     # ended session does not leave a stale id looking like an open one.
     - name: "Charger Transaction ID"
       unique_id: ocpp_charger_transaction_id
-      state_topic: "ocpp/MOBI-ALM-00058/state"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
       icon: mdi:identifier
       value_template: "{{ value_json.transaction_id | default('none', true) }}"
       availability: *proxy_availability
@@ -158,7 +158,7 @@ mqtt:
 
     - name: "Charger Authorization"
       unique_id: ocpp_charger_authorization
-      state_topic: "ocpp/MOBI-ALM-00058/central_system/Authorize"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/central_system/Authorize"
       icon: mdi:card-account-details-outline
       value_template: "{{ value_json.payload[2].idTagInfo.status | default('Unknown', true) }}"
       availability: *proxy_availability
@@ -169,7 +169,7 @@ mqtt:
     # reporting a stale or zero figure that would make session energy wrong.
     - name: "Charger Session Meter Start"
       unique_id: ocpp_charger_session_meter_start
-      state_topic: "ocpp/MOBI-ALM-00058/state"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
       device_class: energy
       state_class: total
       unit_of_measurement: "kWh"
@@ -177,10 +177,10 @@ mqtt:
         {{ ((value_json.meter_start_wh | default(0, true)) | float(0) / 1000) | round(3) }}
       availability_mode: all
       availability:
-        - topic: "ocpp/MOBI-ALM-00058/availability"
+        - topic: "ocpp/@CHARGE_POINT_ID@/availability"
           payload_available: "online"
           payload_not_available: "offline"
-        - topic: "ocpp/MOBI-ALM-00058/state"
+        - topic: "ocpp/@CHARGE_POINT_ID@/state"
           value_template: >-
             {{ 'online' if (value_json.meter_start_wh | default(none)) is not none else 'offline' }}
           payload_available: "online"
@@ -200,7 +200,7 @@ mqtt:
     # same quantity as before, so its recorder history stays continuous.
     - name: "Charger Last Session Energy"
       unique_id: ocpp_charger_last_session_energy
-      state_topic: "ocpp/MOBI-ALM-00058/state"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
       device_class: energy
       state_class: total
       unit_of_measurement: "kWh"
@@ -208,13 +208,13 @@ mqtt:
       # not the energy that session delivered. That is the sensor below.
       value_template: >-
         {{ ((value_json.last_meter_stop_wh | default(0, true)) | float(0) / 1000) | round(3) }}
-      json_attributes_topic: "ocpp/MOBI-ALM-00058/state"
+      json_attributes_topic: "ocpp/@CHARGE_POINT_ID@/state"
       availability_mode: all
       availability:
-        - topic: "ocpp/MOBI-ALM-00058/availability"
+        - topic: "ocpp/@CHARGE_POINT_ID@/availability"
           payload_available: "online"
           payload_not_available: "offline"
-        - topic: "ocpp/MOBI-ALM-00058/state"
+        - topic: "ocpp/@CHARGE_POINT_ID@/state"
           value_template: >-
             {{ 'online' if (value_json.last_meter_stop_wh | default(none)) is not none else 'offline' }}
           payload_available: "online"
@@ -230,7 +230,7 @@ mqtt:
     # a real charge.
     - name: "Charger Last Session Delivered"
       unique_id: ocpp_charger_last_session_delivered
-      state_topic: "ocpp/MOBI-ALM-00058/state"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
       device_class: energy
       state_class: total
       unit_of_measurement: "kWh"
@@ -239,10 +239,10 @@ mqtt:
         {{ ((value_json.last_session_energy_wh | default(0, true)) | float(0) / 1000) | round(3) }}
       availability_mode: all
       availability:
-        - topic: "ocpp/MOBI-ALM-00058/availability"
+        - topic: "ocpp/@CHARGE_POINT_ID@/availability"
           payload_available: "online"
           payload_not_available: "offline"
-        - topic: "ocpp/MOBI-ALM-00058/state"
+        - topic: "ocpp/@CHARGE_POINT_ID@/state"
           value_template: >-
             {{ 'online' if (value_json.last_session_energy_wh | default(none)) is not none else 'offline' }}
           payload_available: "online"
@@ -251,7 +251,7 @@ mqtt:
 
     - name: "Charger Last Session End Reason"
       unique_id: ocpp_charger_last_session_end_reason
-      state_topic: "ocpp/MOBI-ALM-00058/state"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
       icon: mdi:power-plug-off-outline
       # Optional in OCPP 1.6 and omitted by this charger on some stops, hence
       # the explicit fallback rather than an availability gate — the row should
@@ -267,14 +267,14 @@ mqtt:
     # This topic is retained, so these survive a Home Assistant restart.
     - name: "OCPP Proxy Upstream"
       unique_id: ocpp_proxy_upstream
-      state_topic: "ocpp/MOBI-ALM-00058/status"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/status"
       icon: mdi:cloud-outline
       value_template: "{{ value_json.upstream | default('unknown', true) }}"
       device: *charger_device
 
     - name: "OCPP Proxy Downstream"
       unique_id: ocpp_proxy_downstream
-      state_topic: "ocpp/MOBI-ALM-00058/status"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/status"
       icon: mdi:ev-plug-type2
       value_template: "{{ value_json.downstream | default('unknown', true) }}"
       device: *charger_device
@@ -286,7 +286,7 @@ mqtt:
     # Alert on this.
     - name: "OCPP Proxy Online"
       unique_id: ocpp_proxy_online
-      state_topic: "ocpp/MOBI-ALM-00058/availability"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/availability"
       payload_on: "online"
       payload_off: "offline"
       device_class: connectivity
@@ -309,15 +309,15 @@ template:
         state_class: total_increasing
         unit_of_measurement: "kWh"
         availability: >-
-          {{ states('sensor.ev_charger_mobi_alm_00058_charger_energy_meter') not in ['unknown', 'unavailable', 'none']
-             and states('sensor.ev_charger_mobi_alm_00058_charger_session_meter_start') not in ['unknown', 'unavailable', 'none'] }}
+          {{ states('sensor.@CHARGE_POINT_SLUG@_charger_energy_meter') not in ['unknown', 'unavailable', 'none']
+             and states('sensor.@CHARGE_POINT_SLUG@_charger_session_meter_start') not in ['unknown', 'unavailable', 'none'] }}
         state: >-
-          {% set now_kwh = states('sensor.ev_charger_mobi_alm_00058_charger_energy_meter') | float(0) %}
-          {% set start_kwh = states('sensor.ev_charger_mobi_alm_00058_charger_session_meter_start') | float(0) %}
+          {% set now_kwh = states('sensor.@CHARGE_POINT_SLUG@_charger_energy_meter') | float(0) %}
+          {% set start_kwh = states('sensor.@CHARGE_POINT_SLUG@_charger_session_meter_start') | float(0) %}
           {{ [now_kwh - start_kwh, 0] | max | round(3) }}
 
       - name: "Charger Charging"
         unique_id: ocpp_charger_is_charging
         icon: mdi:flash
         state: >-
-          {{ 'on' if states('sensor.ev_charger_mobi_alm_00058_charger_status') == 'Charging' else 'off' }}
+          {{ 'on' if states('sensor.@CHARGE_POINT_SLUG@_charger_status') == 'Charging' else 'off' }}

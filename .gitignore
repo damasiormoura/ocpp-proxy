@@ -30,3 +30,9 @@ Thumbs.db
 # the ones this repo accumulated recorded tests that were out of step with the
 # specification rather than defects in the code.
 tests/*.proptest-regressions
+
+# Deployment parameters and rendered output. Every site-specific value — the
+# Charge Point ID, the Central System address, the broker address — is a
+# deployment parameter, not repository content. See deploy/local.env.example.
+deploy/local.env
+deploy/.rendered/

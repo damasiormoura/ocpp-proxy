@@ -17,7 +17,7 @@ set -uo pipefail
 
 IFACE="wwan0"
 LXC_NET="10.80.0.0/30"
-MOBIE_NET="10.200.10.0/24"
+MOBIE_NET="@CENTRAL_SYSTEM_NETWORK@"
 LOG_TAG="ocpp-wwan"
 
 # Filled in from /etc/default/ocpp-wwan so this script carries no site values.

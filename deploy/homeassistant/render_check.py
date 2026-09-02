@@ -5,9 +5,14 @@ This is the check that caught the `| first` bug: the templates are the part
 with no compiler behind them, so they get exercised against captured payloads
 rather than eyeballed.
 """
-import json, sys, yaml, jinja2
+import json, os, sys, yaml, jinja2
 
-PKG = "deploy/homeassistant/ocpp_proxy.yaml"
+# The template if it has not been rendered, the rendered copy if it has. The
+# placeholders only appear in topic strings, which this check does not evaluate,
+# so both work — but checking the rendered copy is what actually ships.
+PKG = "deploy/.rendered/deploy/homeassistant/ocpp_proxy.yaml"
+if not os.path.exists(PKG):
+    PKG = "deploy/homeassistant/ocpp_proxy.yaml"
 
 env = jinja2.Environment(undefined=jinja2.Undefined)
 
@@ -26,12 +31,12 @@ AFTER_SESSION = {
     "connector_status": "Available", "error_code": "NoError",
     "transaction_id": None, "id_tag": None, "meter_start_wh": None,
     "last_meter_stop_wh": 8084000, "last_session_energy_wh": 7555,
-    "last_transaction_id": 1788214378, "last_stop_reason": "EVDisconnected",
+    "last_transaction_id": 1000000001, "last_stop_reason": "EVDisconnected",
     "last_stop_time": "2026-09-01T07:22:16Z",
     "last_updated": "2026-09-01T07:22:16+00:00",
 }
 MID_SESSION = dict(AFTER_SESSION, connector_status="Charging",
-                   transaction_id=1788214379, id_tag="7264b25e",
+                   transaction_id=1000000002, id_tag="a1b2c3d4",
                    meter_start_wh=8084000)
 FRESH = {k: None for k in AFTER_SESSION}
 FRESH.update(connector_status="Available", error_code="NoError")
@@ -85,7 +90,7 @@ CASES = [
 
     ("Charger Status",                 AFTER_SESSION, "online",  "Available"),
     ("Charger Transaction ID",         AFTER_SESSION, "online",  "none"),
-    ("Charger Transaction ID",         MID_SESSION,   "online",  "1788214379"),
+    ("Charger Transaction ID",         MID_SESSION,   "online",  "1000000002"),
 ]
 
 fails = 0

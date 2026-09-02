@@ -185,12 +185,12 @@ mod tests {
         st.apply(
             "StartTransaction",
             &call("StartTransaction"),
-            r#"[2,"2","StartTransaction",{"connectorId":1,"idTag":"7264b25e","meterStart":8076445}]"#,
+            r#"[2,"2","StartTransaction",{"connectorId":1,"idTag":"a1b2c3d4","meterStart":8076445}]"#,
         );
         st.apply(
             "StopTransaction",
             &call("StopTransaction"),
-            r#"[2,"3","StopTransaction",{"meterStop":8084000,"transactionId":1788214378,"reason":"EVDisconnected"}]"#,
+            r#"[2,"3","StopTransaction",{"meterStop":8084000,"transactionId":1000000001,"reason":"EVDisconnected"}]"#,
         );
         st
     }
@@ -214,17 +214,17 @@ mod tests {
         let store = SnapshotStore::new(Some(path.clone()));
 
         let mut map = SnapshotMap::new();
-        map.insert("MOBI-ALM-00058".to_string(), snapshot_after_a_session());
+        map.insert("CP-EXAMPLE-0001".to_string(), snapshot_after_a_session());
         store.save(&map);
 
         // A fresh store, as a restarted process would build.
         let restored = SnapshotStore::new(Some(path.clone())).load();
         assert_eq!(restored, map);
 
-        let cp = &restored["MOBI-ALM-00058"];
+        let cp = &restored["CP-EXAMPLE-0001"];
         assert_eq!(cp.last_meter_stop_wh, Some(8084000));
         assert_eq!(cp.last_session_energy_wh, Some(8084000 - 8076445));
-        assert_eq!(cp.last_transaction_id, Some(1788214378));
+        assert_eq!(cp.last_transaction_id, Some(1000000001));
         assert_eq!(cp.last_stop_reason.as_deref(), Some("EVDisconnected"));
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

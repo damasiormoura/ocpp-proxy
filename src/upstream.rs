@@ -191,10 +191,10 @@ mod tests {
     #[test]
     fn test_build_upstream_url_matches_the_mobie_endpoint() {
         let url = build_upstream_url(
-            &Url::parse("ws://10.200.10.200/ocpp/1.6").unwrap(),
-            "MOBI-ALM-00058",
+            &Url::parse("ws://10.0.0.10/ocpp/1.6").unwrap(),
+            "CP-EXAMPLE-0001",
         );
-        assert_eq!(url.as_str(), "ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058");
+        assert_eq!(url.as_str(), "ws://10.0.0.10/ocpp/1.6/CP-EXAMPLE-0001");
     }
 
     /// Requirement 2.2 — the ID is mirrored verbatim, whatever it contains.
@@ -202,7 +202,7 @@ mod tests {
     fn test_build_upstream_url_preserves_charge_point_id() {
         for id in [
             "PT-MOB-CP-12345-AB",
-            "MOBI-ALM-00058",
+            "CP-EXAMPLE-0001",
             "lowercase-id",
             "ID_WITH_UNDERSCORES",
             "1234567890",

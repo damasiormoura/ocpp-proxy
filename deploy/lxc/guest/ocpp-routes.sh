@@ -16,7 +16,7 @@
 # ocpp-routes.service.
 set -u
 
-MOBIE_NET="10.200.10.0/24"
+MOBIE_NET="@CENTRAL_SYSTEM_NETWORK@"
 MOBIE_GW="10.80.0.1"        # the Proxmox host, across vmbr2
 MOBIE_DEV="eth1"
 

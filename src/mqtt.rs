@@ -989,8 +989,8 @@ mod tests {
     #[test]
     fn test_state_topic() {
         assert_eq!(
-            charge_point_state_topic("MOBI-ALM-00058"),
-            "ocpp/MOBI-ALM-00058/state"
+            charge_point_state_topic("CP-EXAMPLE-0001"),
+            "ocpp/CP-EXAMPLE-0001/state"
         );
     }
 
@@ -1048,18 +1048,18 @@ mod tests {
         st.apply(
             "StartTransaction",
             &call("StartTransaction"),
-            r#"[2,"2","StartTransaction",{"connectorId":1,"idTag":"7264b25e","meterStart":8076445}]"#,
+            r#"[2,"2","StartTransaction",{"connectorId":1,"idTag":"a1b2c3d4","meterStart":8076445}]"#,
         );
         assert_eq!(st.meter_start_wh, Some(8076445));
-        assert_eq!(st.id_tag.as_deref(), Some("7264b25e"));
+        assert_eq!(st.id_tag.as_deref(), Some("a1b2c3d4"));
         assert_eq!(st.transaction_id, None, "id is not known until the result");
 
         st.apply(
             "StartTransaction",
             &OcppMessageType::CallResult,
-            r#"[3,"2",{"idTagInfo":{"status":"Accepted"},"transactionId":1788214378}]"#,
+            r#"[3,"2",{"idTagInfo":{"status":"Accepted"},"transactionId":1000000001}]"#,
         );
-        assert_eq!(st.transaction_id, Some(1788214378));
+        assert_eq!(st.transaction_id, Some(1000000001));
 
         st.apply(
             "StatusNotification",
@@ -1073,7 +1073,7 @@ mod tests {
         st.apply(
             "StopTransaction",
             &call("StopTransaction"),
-            r#"[2,"4","StopTransaction",{"idTag":"7264b25e","meterStop":8080000,"transactionId":1788214378,"reason":"EVDisconnected","timestamp":"2026-09-01T07:22:16Z"}]"#,
+            r#"[2,"4","StopTransaction",{"idTag":"a1b2c3d4","meterStop":8080000,"transactionId":1000000001,"reason":"EVDisconnected","timestamp":"2026-09-01T07:22:16Z"}]"#,
         );
         assert_eq!(st.transaction_id, None);
         assert_eq!(st.meter_start_wh, None);
@@ -1087,7 +1087,7 @@ mod tests {
         // ...and must record what the session that just ended did.
         assert_eq!(st.last_meter_stop_wh, Some(8080000));
         assert_eq!(st.last_session_energy_wh, Some(8080000 - 8076445));
-        assert_eq!(st.last_transaction_id, Some(1788214378));
+        assert_eq!(st.last_transaction_id, Some(1000000001));
         assert_eq!(st.last_stop_reason.as_deref(), Some("EVDisconnected"));
         assert_eq!(st.last_stop_time.as_deref(), Some("2026-09-01T07:22:16Z"));
     }
@@ -1143,14 +1143,14 @@ mod tests {
         st.apply(
             "StopTransaction",
             &call("StopTransaction"),
-            r#"[2,"1","StopTransaction",{"meterStop":8084000,"transactionId":1788214378}]"#,
+            r#"[2,"1","StopTransaction",{"meterStop":8084000,"transactionId":1000000001}]"#,
         );
         assert_eq!(st.last_meter_stop_wh, Some(8084000));
         assert_eq!(
             st.last_session_energy_wh, None,
             "an unknown delta must not be reported as zero"
         );
-        assert_eq!(st.last_transaction_id, Some(1788214378));
+        assert_eq!(st.last_transaction_id, Some(1000000001));
     }
 
     /// `reason` and `timestamp` are optional in OCPP 1.6 and this charger
@@ -1244,12 +1244,12 @@ mod tests {
         st.apply(
             "StopTransaction",
             &call("StopTransaction"),
-            r#"[2,"9","StopTransaction",{"meterStop":8084000,"transactionId":1788214378,"reason":"EVDisconnected"}]"#,
+            r#"[2,"9","StopTransaction",{"meterStop":8084000,"transactionId":1000000001,"reason":"EVDisconnected"}]"#,
         );
         let v: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(&st).unwrap()).unwrap();
         assert_eq!(v["last_meter_stop_wh"], 8084000);
-        assert_eq!(v["last_transaction_id"], 1788214378);
+        assert_eq!(v["last_transaction_id"], 1000000001);
         assert_eq!(v["last_stop_reason"], "EVDisconnected");
     }
 
@@ -1536,14 +1536,14 @@ mod tests {
         st.apply(
             "StartTransaction",
             &call("StartTransaction"),
-            r#"[2,"1","StartTransaction",{"connectorId":1,"idTag":"7264b25e","meterStart":8076445}]"#,
+            r#"[2,"1","StartTransaction",{"connectorId":1,"idTag":"a1b2c3d4","meterStart":8076445}]"#,
         );
         st.apply(
             "StopTransaction",
             &call("StopTransaction"),
-            r#"[2,"2","StopTransaction",{"meterStop":8084000,"transactionId":1788214378}]"#,
+            r#"[2,"2","StopTransaction",{"meterStop":8084000,"transactionId":1000000001}]"#,
         );
-        before.insert("MOBI-ALM-00058".to_string(), st);
+        before.insert("CP-EXAMPLE-0001".to_string(), st);
         store.save(&before);
 
         // What the restarted process builds.
@@ -1551,7 +1551,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel(100);
         let publisher = MqttPublisher::new(
             &config,
-            Some("MOBI-ALM-00058".to_string()),
+            Some("CP-EXAMPLE-0001".to_string()),
             rx,
             500,
             SnapshotStore::new(Some(path)),
@@ -1560,11 +1560,11 @@ mod tests {
 
         let restored = publisher
             .charge_point_state
-            .get("MOBI-ALM-00058")
+            .get("CP-EXAMPLE-0001")
             .expect("the stored snapshot must be loaded by `new`");
         assert_eq!(restored.last_meter_stop_wh, Some(8084000));
         assert_eq!(restored.last_session_energy_wh, Some(7555));
-        assert_eq!(restored.last_transaction_id, Some(1788214378));
+        assert_eq!(restored.last_transaction_id, Some(1000000001));
     }
 
     /// Every snapshot change is persisted, including while the broker is

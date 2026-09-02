@@ -6,10 +6,10 @@ Wants=network-online.target
 
 # Why this exists.
 #
-# The Central System is ws://10.200.10.200/ocpp/1.6/MOBI-ALM-00058 — a fixed
+# The Central System is the Central System URL (see deploy/local.env) — a fixed
 # RFC1918 address reachable only inside the APN. Without the route below, the
 # container matches its LAN default route and sends Mobi.e traffic to the main
-# router, which cannot reach 10.200.10.0/24. The symptom is "Mobi.e
+# router, which cannot reach @CENTRAL_SYSTEM_NETWORK@. The symptom is "Mobi.e
 # unreachable", which reads as an upstream fault rather than a routing mistake.
 #
 # The route is needed in BOTH places: here, so the container hands the packet
@@ -34,7 +34,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/ocpp-routes.sh
-ExecStop=/bin/sh -c 'ip route del 10.200.10.0/24 2>/dev/null || true'
+ExecStop=/bin/sh -c 'ip route del @CENTRAL_SYSTEM_NETWORK@ 2>/dev/null || true'
 ExecStop=/bin/sh -c 'ip route del 192.168.51.0/24 2>/dev/null || true'
 
 # The script already waits for each next hop, but a container that comes back

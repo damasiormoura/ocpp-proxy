@@ -85,7 +85,7 @@ Three distinct paths leave the proxy, and they must not be confused with one ano
 
 **MSS clamping is required, not optional.** Mobile APNs frequently present an MTU below 1500. Without clamping, the TCP handshake succeeds and small OCPP frames flow, but larger frames stall — producing an intermittent fault that looks like an application bug and is expensive to diagnose.
 
-The dongle's LAN side is now known: `192.168.0.0/24`, gateway `192.168.0.1`. The APN itself is a closed network — generic internet egress and all DNS are blocked while the modem reports a healthy connected LTE session, which is the expected behaviour of a Mobi.e-only APN and must not be treated as a fault. What remains unknown is the Central System endpoint itself, without which the path cannot be tested end to end.
+The dongle's LAN side is now known: `$WWAN_NETWORK`, gateway `$WWAN_GATEWAY`. The APN itself is a closed network — generic internet egress and all DNS are blocked while the modem reports a healthy connected LTE session, which is the expected behaviour of a Mobi.e-only APN and must not be treated as a fault. What remains unknown is the Central System endpoint itself, without which the path cannot be tested end to end.
 
 ### Availability and Failure Modes
 
