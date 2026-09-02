@@ -23,7 +23,7 @@ OCPP Proxy is a WebSocket proxy for OCPP 1.6J (Open Charge Point Protocol) that 
 ## Deployment
 
 - Runs as a native binary under systemd in an unprivileged LXC (113) on the Proxmox host `mouraishikawa`
-- Connects to the Mosquitto broker on VM 110 (Home Assistant) over one LAN hop; TLS optional
+- Connects to the EMQX broker on VM 110 (Home Assistant) over one LAN hop; TLS optional
 - Reaches Mobi.e over a mobile APN on a ZTE 4G USB dongle owned by the Proxmox host
 - Is the charger's only path to Mobi.e: no failover, so host downtime stops charging and billing
 - Designed for a single charger setup (but supports Charge Point ID routing)

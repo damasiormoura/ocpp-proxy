@@ -20,7 +20,7 @@ component and no HACS — plain MQTT discovery via YAML.
 3. **Dashboard.** Settings → Dashboards → your dashboard → pencil → ⋮ → *Raw
    configuration editor*, and paste the `views:` entry from `dashboard.yaml`.
 
-The MQTT broker is the Mosquitto add-on the proxy already publishes to, so no
+The MQTT broker is the EMQX add-on the proxy already publishes to, so no
 broker configuration is needed.
 
 ## What you get

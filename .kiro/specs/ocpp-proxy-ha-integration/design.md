@@ -43,7 +43,7 @@ graph TB
         subgraph LXC["LXC 113 ocpp-proxy (unprivileged)"]
             Proxy["OCPP Proxy<br/>systemd, Restart=always"]
         end
-        HA["VM 110 homeassistant<br/>HAOS + Mosquitto<br/>192.168.50.167"]
+        HA["VM 110 homeassistant<br/>HAOS + EMQX<br/>192.168.50.167"]
     end
 
     subgraph LAN["IoT network 192.168.51.0/24"]
@@ -863,7 +863,9 @@ Focus on specific scenarios and edge cases:
 ### Test Infrastructure
 
 - **Mock WebSocket server** — Simulates the Mobi.e Central System for integration tests
-- **Mock MQTT broker** — Local Mosquitto instance for integration tests
+- **MQTT event channel** — the end-to-end tests assert on the `MqttEvent`s the
+  session emits rather than standing up a broker, so they stay hermetic. Payload
+  and topic construction are covered by unit tests in `mqtt.rs`
 - **Tokio test runtime** — `#[tokio::test]` for all async tests with configurable timeouts
 
 ### Tests this revision requires

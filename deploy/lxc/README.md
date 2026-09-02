@@ -26,7 +26,7 @@ obvious.
 | Charger port | `9000` on the `vmbr1` address only |
 | Charger network | `192.168.51.0/24` (IoT), via the TL-WPA4220 powerline AP |
 | Health port | `8080` |
-| MQTT broker | `192.168.50.167:1883` (Mosquitto on VM 110) |
+| MQTT broker | `192.168.50.167:1883` (EMQX add-on on VM 110) |
 | Host WWAN interface | `wwan0` (ZTE `19d2:1405`, `cdc_ether`) |
 
 `.28` is the next free address in the container block per
@@ -405,7 +405,7 @@ ssh proxmox 'pct exec 113 -- adduser --system --group --no-create-home ocpp
 ```
 
 Create `/etc/ocpp-proxy/secrets.env` inside the container from
-`guest/secrets.env.example`, mode 600 owner `root:ocpp`, with the Mosquitto
+`guest/secrets.env.example`, mode 600 owner `root:ocpp`, with the EMQX
 credentials. **Do not put them in `config.yaml`, and never commit them.**
 
 ```bash

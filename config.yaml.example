@@ -68,7 +68,7 @@ health_port: 8080
 # REQUIRED: MQTT Broker Configuration
 # ------------------------------------------------------------------------------
 mqtt:
-  # Hostname or IP of the MQTT broker (Mosquitto on Raspberry Pi)
+  # Hostname or IP of the MQTT broker
   host: "mqtt.example.com"
 
   # MQTT broker port (typically 8883 for MQTTS)
@@ -82,7 +82,7 @@ mqtt:
 
   # TLS certificate paths for secure MQTT connection
   # All three are required for mutual TLS authentication
-  # OPTIONAL. The broker is one LAN hop away (Mosquitto on the Home Assistant
+  # OPTIONAL. The broker is one LAN hop away (EMQX on the Home Assistant
   # VM), not across the internet, so TLS is not required.
   #   all three omitted  -> plaintext, username/password only
   #   ca_cert_path only  -> server-authenticated TLS

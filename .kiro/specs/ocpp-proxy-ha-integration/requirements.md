@@ -21,7 +21,7 @@ The Proxy is therefore designed to fail *closed and loudly* — it must make its
 - **Proxy**: The OCPP Proxy application that relays WebSocket messages between the Charger and the Central_System
 - **Charger**: The Autel EV charger acting as an OCPP 1.6J Charge Point client
 - **Central_System**: The Mobi.e OCPP Central System server that manages charging sessions and billing
-- **MQTT_Broker**: The Mosquitto MQTT broker running as a Home Assistant add-on on VM 110 (`homeassistant`, HAOS) at `192.168.50.167`
+- **MQTT_Broker**: The EMQX MQTT broker running as a Home Assistant add-on on VM 110 (`homeassistant`, HAOS) at `192.168.50.167`
 - **Home_Assistant**: The home automation platform running on HAOS as VM 110 on the same Proxmox host
 - **Proxmox_Host**: The Proxmox VE host `mouraishikawa` (`192.168.50.10`) running the Proxy LXC and owning the 4G dongle
 - **Proxy_LXC**: The dedicated unprivileged LXC container running the Proxy

@@ -57,7 +57,8 @@ listen_port: 9000
 health_port: 8080
 
 # --- MQTT ------------------------------------------------------------------
-# Mosquitto runs as a Home Assistant add-on on VM 110, one LAN hop away.
+# EMQX runs as a Home Assistant add-on on VM 110, one LAN hop away.
+# (Add-on slug a0d7b954_emqx — not Mosquitto, which is not installed.)
 # TLS is optional and omitted here: the previous mutual-TLS requirement existed
 # because the broker was to be reached across the internet from AWS. It is not.
 # To enable TLS later, set ca_cert_path (server-auth) and optionally

@@ -11,14 +11,15 @@ A transparent WebSocket proxy for OCPP 1.6J that bridges EV chargers to a Centra
                                 │              ZTE 4G USB dongle (wwan0)
                              MQTT │
                     ┌─────────────▼──────────┐
-                    │ VM 110  Mosquitto      │
+                    │ VM 110  EMQX           │
                     │ Home Assistant (HAOS)  │
                     └────────────────────────┘
 ```
 
 The charger reaches the proxy over the local network. The proxy reaches Mobi.e
-over a mobile APN served by a 4G dongle on the Proxmox host, selected by policy
-routing on the proxy's upstream source address.
+over a mobile APN served by a 4G dongle on the Proxmox host, selected by a
+destination route: the Central System is a literal RFC1918 address inside the
+APN, so no source-address policy routing is needed.
 
 ## Features
 
@@ -36,7 +37,7 @@ routing on the proxy's upstream source address.
 ### Prerequisites
 
 - Rust 1.82+
-- An MQTT broker with TLS (e.g., Mosquitto)
+- An MQTT broker — EMQX in this deployment, Mosquitto works too; TLS optional
 - Access to an OCPP 1.6J Central System
 
 ### Build
