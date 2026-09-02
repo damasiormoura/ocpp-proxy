@@ -94,8 +94,22 @@ jobs:
       - name: Pre-flight — is a charging session in progress?
         run: |
           SSH="ssh -i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=10 $PROXMOX"
-          state=$($SSH "pct exec $LXC_ID -- cat /var/lib/ocpp-proxy/state.json" 2>/dev/null || echo '{}')
+
+          # Separate "the host would not answer" from "there is no snapshot".
+          # The first means this guard cannot do its job, and a safety check
+          # that cannot run must stop the deploy rather than wave it through.
+          # The second is ordinary: persistence can be off, or the proxy may
+          # never have written one yet.
+          if ! state=$($SSH "pct exec $LXC_ID -- sh -c 'cat /var/lib/ocpp-proxy/state.json 2>/dev/null || echo NO_SNAPSHOT'"); then
+            echo "::error::Could not read the proxy's state over SSH, so whether a" \
+                 "session is open is unknown. Refusing to deploy blind."
+            exit 1
+          fi
           echo "snapshot: $state"
+          if [ "$state" = "NO_SNAPSHOT" ]; then
+            echo "::notice::No state snapshot on the target — nothing says a session is open."
+            state='{}'
+          fi
           # One line on purpose: a multi-line heredoc at column 0 would break
           # the YAML block scalar this step is written in.
           open=$(printf '%s' "$state" | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next((str(c["transaction_id"]) for c in m.values() if c.get("transaction_id") is not None), ""))' 2>/dev/null || true)
