@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The official rust image ships rustup's minimal profile — no rustfmt, no
       # clippy — and runs as root, which left a root-owned target/ in the
@@ -100,7 +100,7 @@ jobs:
              python3 deploy/homeassistant/render_check.py'
 
       - name: Upload binary
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ocpp-proxy-${{ github.sha }}
           path: /home/runner/.cache/ocpp-proxy/target/release/ocpp-proxy
