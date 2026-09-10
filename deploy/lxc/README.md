@@ -271,16 +271,35 @@ scp host/wwan-watchdog.sh            proxmox:/usr/local/sbin/
 scp host/ocpp-wwan-watchdog.service  proxmox:/etc/systemd/system/
 scp host/ocpp-wwan-watchdog.timer    proxmox:/etc/systemd/system/
 ssh proxmox 'chmod 750 /usr/local/sbin/wwan-watchdog.sh'
-ssh proxmox 'printf "WWAN_GW=$WWAN_GATEWAY\nPROBE_HOST=$CENTRAL_SYSTEM_HOST\nPROBE_PORT=80\n" > /etc/default/ocpp-wwan'
+ssh proxmox 'printf "WWAN_ADDR=$WWAN_ADDRESS\nWWAN_GW=$WWAN_GATEWAY\nPROBE_HOST=$CENTRAL_SYSTEM_HOST\nPROBE_PORT=80\n" > /etc/default/ocpp-wwan'
 ssh proxmox 'systemctl daemon-reload && systemctl enable --now ocpp-wwan-watchdog.timer'
 ```
 
-It checks the link, the Mobi.e route, the NAT rule and the MSS clamp every
-5 minutes, is silent when healthy (verified — a healthy run emits zero log
-lines, so anything in the log is a real repair), repairs what is missing, and logs to syslog under
-tag `ocpp-wwan` — which LXC 101 collects. Same check-repair-log pattern as
+It checks the link, the dongle's own static IPv4 address, the Mobi.e route,
+the NAT rule and the MSS clamp every 5 minutes, is silent when healthy
+(verified — a healthy run emits zero log lines, so anything in the log is a
+real repair), repairs what is missing, and logs to syslog under tag
+`ocpp-wwan` — which LXC 101 collects. Same check-repair-log pattern as
 `iot-isolation-enforce.sh`, and for the same reason: state you set up once does
 not stay set up.
+
+> **Incident 2026-09-10: the address check above didn't always exist.**
+> Reported as "the car is not charging." `wwan0` was found link-up (carrier
+> and operstate both `up`) but carrying no IPv4 address at all — silently,
+> with no ifup/hotplug event in the logs to explain it, and no udev rule on
+> this host wires `allow-hotplug` interfaces back up on re-enumeration. With
+> no address in the dongle's LAN, `ip route replace $CENTRAL_SYSTEM_NETWORK
+> via $WWAN_GATEWAY dev wwan0` failed with `Nexthop has invalid gateway` —
+> exactly what the watchdog had been logging every ~5 minutes for 3+ hours,
+> unable to self-heal, because at the time it only ever re-asserted the
+> route, never the address it depends on. Fixed live (`ip addr add`,
+> re-triggered the watchdog; the active charging session's transaction ID
+> was confirmed unchanged before and after), then closed for good by adding
+> the address check now in step 3 above — verified by deleting the address
+> again and watching the next timer tick restore it unattended. The
+> underlying "why did the address disappear" is still open; if it recurs,
+> look at the dongle itself (thermal reset, firmware) rather than trusting
+> the watchdog to paper over it indefinitely.
 
 ## Step 4 — Create the container
 
