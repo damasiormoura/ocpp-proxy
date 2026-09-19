@@ -3,9 +3,32 @@
 //! Asynchronously publishes OCPP events to the MQTT broker, decoupled from the forwarding path.
 //! Uses rumqttc for MQTT 3.1.1 connectivity with TLS, Last Will and Testament, and automatic
 //! reconnection with exponential backoff.
+//!
+//! # Why nothing here ever awaits a publish
+//!
+//! rumqttc's `AsyncClient` hands requests to the `EventLoop` over a bounded
+//! channel, and only `EventLoop::poll()` moves them from that channel onto the
+//! wire. The publisher drives that event loop itself, from the same task, so
+//! any `publish(..).await` made while `poll()` is not being awaited — inside
+//! the handler for an event `poll()` just returned, say — waits for room that
+//! only `poll()` can make. With more messages than the channel holds, that
+//! wait never ends: the task parks, keepalives stop, the broker publishes the
+//! Last Will, and the process keeps running with its Home Assistant side dead
+//! and nothing in the log to say so. That is exactly what happened on
+//! 2026-09-19, when a broker restart found 14 buffered messages and the
+//! channel holds [`REQUEST_CHANNEL_CAPACITY`].
+//!
+//! So every publish goes through [`MqttPublisher::enqueue`]: the message joins
+//! the FIFO buffer and [`MqttPublisher::drain_buffer`] hands as many of the
+//! front of the buffer to the client as `try_publish` accepts, never blocking.
+//! Whatever does not fit waits for the next event-loop tick, which drains
+//! again. The buffer is therefore both the "broker unreachable" store and the
+//! staging queue in front of the request channel, and FIFO order holds across
+//! both roles.
 
 use std::collections::VecDeque;
 use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rumqttc::TlsConfiguration;
@@ -13,14 +36,26 @@ use rumqttc::{AsyncClient, Event, EventLoop, Incoming, LastWill, MqttOptions, Qo
 
 use crate::snapshot_store::SnapshotStore;
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::config::MqttConfig;
 use crate::error::ProxyError;
 use crate::forwarder::MqttEvent;
-use crate::models::{ConnectionState, Direction, ExponentialBackoff, OcppMessageType};
+use crate::models::{
+    ConnectionId, ConnectionState, Direction, ExponentialBackoff, OcppMessageType,
+};
+use crate::state::ConnectionStateManager;
+
+/// Depth of the request channel between the `AsyncClient` and its `EventLoop`.
+///
+/// Small on purpose: the channel is only staging for what `poll()` writes
+/// next, and the FIFO buffer behind it (`buffers.mqtt_buffer_size`, 500 by
+/// default) is where anything waiting actually lives. Any value works for
+/// correctness — nothing blocks on it any more — but it is the threshold the
+/// regression tests exercise, so it is named rather than inlined.
+pub const REQUEST_CHANNEL_CAPACITY: usize = 10;
 
 /// A buffered MQTT message awaiting publication.
 #[derive(Debug, Clone)]
@@ -261,6 +296,20 @@ pub struct MqttPublisher {
     /// Durable backing for `charge_point_state`, so a proxy restart does not
     /// lose what the last session recorded. See `snapshot_store`.
     snapshot_store: SnapshotStore,
+    /// The process-wide connection state, when the publisher was given one.
+    ///
+    /// `/health` reads `mqtt` from here. Before this existed, `main` set it
+    /// once after the startup connect and nothing ever updated it again, so
+    /// the endpoint reported `connected` through a six-hour outage.
+    state_manager: Option<Arc<Mutex<ConnectionStateManager>>>,
+    /// Number of messages published so far by the flush that a reconnect
+    /// started, while that flush is still in progress; `None` otherwise.
+    ///
+    /// The flush is no longer one call: it proceeds across event-loop ticks
+    /// as the request channel makes room. This is what lets the log still
+    /// say `Flushed buffered MQTT messages` exactly once, when the backlog
+    /// the reconnect found has actually gone.
+    flush_in_progress: Option<usize>,
 }
 
 impl MqttPublisher {
@@ -322,7 +371,7 @@ impl MqttPublisher {
         }
 
         // Create client and event loop
-        let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
+        let (client, eventloop) = AsyncClient::new(mqttoptions, REQUEST_CHANNEL_CAPACITY);
 
         Ok(Self {
             client,
@@ -340,7 +389,27 @@ impl MqttPublisher {
             // fold a message in ahead of the restore.
             charge_point_state: snapshot_store.load(),
             snapshot_store,
+            state_manager: None,
+            flush_in_progress: None,
         })
+    }
+
+    /// Mirror every MQTT connection state change into the shared manager, so
+    /// `/health` reports what the event loop actually sees.
+    pub fn with_state_manager(mut self, manager: Arc<Mutex<ConnectionStateManager>>) -> Self {
+        self.state_manager = Some(manager);
+        self
+    }
+
+    /// Record a connection state change, locally and in the shared manager.
+    async fn set_state(&mut self, new_state: ConnectionState) {
+        self.state = new_state;
+        if let Some(manager) = &self.state_manager {
+            manager
+                .lock()
+                .await
+                .transition(ConnectionId::Mqtt, new_state);
+        }
     }
 
     /// Build TLS configuration from certificate files, if TLS is configured.
@@ -391,7 +460,7 @@ impl MqttPublisher {
     /// The caller should proceed regardless and the event loop will continue
     /// reconnection attempts.
     pub async fn try_connect(&mut self, timeout: Duration) -> Result<bool, ProxyError> {
-        self.state = ConnectionState::Connecting;
+        self.set_state(ConnectionState::Connecting).await;
         info!(
             component = "mqtt",
             charge_point_id = self.lwt_id(),
@@ -410,7 +479,7 @@ impl MqttPublisher {
                     "MQTT connection timeout after {:?}, proceeding without MQTT",
                     timeout
                 );
-                self.state = ConnectionState::Reconnecting;
+                self.set_state(ConnectionState::Reconnecting).await;
                 return Ok(false);
             }
 
@@ -421,21 +490,7 @@ impl MqttPublisher {
                         charge_point_id = self.lwt_id(),
                         "MQTT connected successfully"
                     );
-                    self.state = ConnectionState::Connected;
-                    self.backoff.reset();
-
-                    // Publish online availability message
-                    if let Err(e) = self.publish_online().await {
-                        warn!(
-                            component = "mqtt",
-                            charge_point_id = self.lwt_id(),
-                            "Failed to publish online status: {}",
-                            e
-                        );
-                    }
-
-                    self.republish_snapshots().await;
-
+                    self.on_connack().await;
                     return Ok(true);
                 }
                 Ok(Ok(_)) => {
@@ -462,38 +517,55 @@ impl MqttPublisher {
                         "MQTT connection timeout after {:?}, proceeding without MQTT",
                         timeout
                     );
-                    self.state = ConnectionState::Reconnecting;
+                    self.set_state(ConnectionState::Reconnecting).await;
                     return Ok(false);
                 }
             }
         }
     }
 
-    /// Publish a retained "online" message to the availability topic.
+    /// What every `ConnAck` triggers, at startup and on each reconnect.
     ///
-    /// Called after successful connection to the broker.
-    pub async fn publish_online(&self) -> Result<(), ProxyError> {
+    /// Order matters and is FIFO through the buffer: `online` first, so the
+    /// availability topic flips back before anything else lands; then the
+    /// backlog the outage left behind; then the retained snapshots, which
+    /// repair a broker that came back without its retained store. Returns as
+    /// soon as the request channel is full — the remainder drains from
+    /// `run()` as the event loop makes room. It never awaits a publish.
+    async fn on_connack(&mut self) {
+        self.set_state(ConnectionState::Connected).await;
+        self.backoff.reset();
+        self.publish_online();
+        self.flush_buffer();
+        self.republish_snapshots();
+    }
+
+    /// Queue a retained "online" message to the availability topic.
+    ///
+    /// Called after every successful connection to the broker. Goes to the
+    /// front of the buffer, ahead of any backlog, so the availability topic is
+    /// the first thing the broker sees change.
+    fn publish_online(&mut self) {
         // Without a configured ID there is no availability topic to own, and
         // no Last Will was registered either. Nothing to announce.
         let Some(id) = self.lwt_charge_point_id.as_deref() else {
-            return Ok(());
+            return;
         };
         let topic = availability_topic(id);
-        self.client
-            .publish(&topic, QoS::AtLeastOnce, true, "online")
-            .await
-            .map_err(|e| ProxyError::ConnectionMqtt {
-                description: format!("Failed to publish online status: {}", e),
-            })?;
+        self.buffer.push_front(MqttMessage {
+            topic: topic.clone(),
+            payload: b"online".to_vec(),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+        });
+        self.drain_buffer();
 
         debug!(
             component = "mqtt",
             charge_point_id = self.lwt_id(),
             topic = %topic,
-            "Published online availability status (retained)"
+            "Queued online availability status (retained)"
         );
-
-        Ok(())
     }
 
     /// Run the MQTT publisher event loop.
@@ -501,6 +573,11 @@ impl MqttPublisher {
     /// Processes events from both the MQTT event loop and the forwarder channel.
     /// Handles reconnection automatically via rumqttc's built-in reconnection,
     /// combined with exponential backoff state tracking.
+    ///
+    /// Nothing in this loop awaits a publish (see the module docs): every
+    /// event-loop tick is also a chance to move more of the buffer into the
+    /// request channel, which is how a backlog larger than the channel gets
+    /// out without ever stalling `poll()`.
     ///
     /// This method runs indefinitely until the event channel is closed.
     pub async fn run(&mut self) {
@@ -521,26 +598,15 @@ impl MqttPublisher {
                                 charge_point_id = self.lwt_id(),
                                 "MQTT reconnected"
                             );
-                            self.state = ConnectionState::Connected;
-                            self.backoff.reset();
-
-                            // Publish online status
-                            if let Err(e) = self.publish_online().await {
-                                warn!(
-                                    component = "mqtt",
-                                    charge_point_id = self.lwt_id(),
-                                    "Failed to publish online status on reconnect: {}",
-                                    e
-                                );
-                            }
-
-                            // Flush buffered messages
-                            self.flush_buffer().await;
-
-                            self.republish_snapshots().await;
+                            self.on_connack().await;
                         }
                         Ok(_) => {
-                            // Other events (PubAck, PingResp, etc.) — handled by rumqttc internally
+                            // Every other event (Outgoing::Publish, PubAck,
+                            // PingResp, ...) means `poll()` just ran, so the
+                            // request channel may have room again.
+                            if self.state == ConnectionState::Connected {
+                                self.drain_buffer();
+                            }
                         }
                         Err(e) => {
                             if self.state == ConnectionState::Connected {
@@ -550,7 +616,7 @@ impl MqttPublisher {
                                     "MQTT connection lost: {}",
                                     e
                                 );
-                                self.state = ConnectionState::Reconnecting;
+                                self.set_state(ConnectionState::Reconnecting).await;
                             }
 
                             // rumqttc handles reconnection internally; we track state
@@ -628,49 +694,13 @@ impl MqttPublisher {
                     }
                 };
 
-                // Publish with QoS 1, retain=false
-                if self.state == ConnectionState::Connected {
-                    if let Err(e) = self
-                        .client
-                        .publish(&topic, QoS::AtLeastOnce, false, payload_bytes.clone())
-                        .await
-                    {
-                        warn!(
-                            component = "mqtt",
-                            charge_point_id = self.lwt_id(),
-                            topic = %topic,
-                            error = %e,
-                            "Failed to publish MQTT message, buffering"
-                        );
-                        self.buffer_message(MqttMessage {
-                            topic,
-                            payload: payload_bytes,
-                            qos: QoS::AtLeastOnce,
-                            retain: false,
-                        });
-                    } else {
-                        debug!(
-                            component = "mqtt",
-                            charge_point_id = self.lwt_id(),
-                            topic = %topic,
-                            "Published OCPP event to MQTT"
-                        );
-                    }
-                } else {
-                    // Broker unreachable — buffer the message
-                    debug!(
-                        component = "mqtt",
-                        charge_point_id = self.lwt_id(),
-                        topic = %topic,
-                        "Broker unreachable, buffering MQTT message"
-                    );
-                    self.buffer_message(MqttMessage {
-                        topic,
-                        payload: payload_bytes,
-                        qos: QoS::AtLeastOnce,
-                        retain: false,
-                    });
-                }
+                // QoS 1, retain=false: events, not state.
+                self.enqueue(MqttMessage {
+                    topic,
+                    payload: payload_bytes,
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                });
 
                 // Fold the message into the retained snapshot, and republish
                 // only if it actually changed something.
@@ -687,8 +717,7 @@ impl MqttPublisher {
                 };
                 if let Some(snapshot) = snapshot {
                     self.snapshot_store.save(&self.charge_point_state);
-                    self.publish_charge_point_state(&charge_point_id, &snapshot)
-                        .await;
+                    self.publish_charge_point_state(&charge_point_id, &snapshot);
                 }
             }
             MqttEvent::StateChange {
@@ -718,49 +747,14 @@ impl MqttPublisher {
                     }
                 };
 
-                // Publish with QoS 1, retain=true (retained status message)
-                if self.state == ConnectionState::Connected {
-                    if let Err(e) = self
-                        .client
-                        .publish(&topic, QoS::AtLeastOnce, true, payload_bytes.clone())
-                        .await
-                    {
-                        warn!(
-                            component = "mqtt",
-                            charge_point_id = self.lwt_id(),
-                            topic = %topic,
-                            error = %e,
-                            "Failed to publish status message, buffering"
-                        );
-                        self.buffer_message(MqttMessage {
-                            topic,
-                            payload: payload_bytes,
-                            qos: QoS::AtLeastOnce,
-                            retain: true,
-                        });
-                    } else {
-                        debug!(
-                            component = "mqtt",
-                            charge_point_id = self.lwt_id(),
-                            topic = %topic,
-                            "Published connection status to MQTT (retained)"
-                        );
-                    }
-                } else {
-                    // Broker unreachable — buffer the message
-                    debug!(
-                        component = "mqtt",
-                        charge_point_id = self.lwt_id(),
-                        topic = %topic,
-                        "Broker unreachable, buffering status message"
-                    );
-                    self.buffer_message(MqttMessage {
-                        topic,
-                        payload: payload_bytes,
-                        qos: QoS::AtLeastOnce,
-                        retain: true,
-                    });
-                }
+                // QoS 1, retain=true: a subscriber that connects later must
+                // see the current link state, not wait for the next change.
+                self.enqueue(MqttMessage {
+                    topic,
+                    payload: payload_bytes,
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                });
             }
         }
     }
@@ -777,7 +771,7 @@ impl MqttPublisher {
     /// session immediately rather than after the charger's next message
     /// republishes a blank one. After a reconnect it repairs a broker that
     /// came back without its retained store.
-    async fn republish_snapshots(&mut self) {
+    fn republish_snapshots(&mut self) {
         let snapshots: Vec<(String, ChargePointState)> = self
             .charge_point_state
             .iter()
@@ -792,15 +786,11 @@ impl MqttPublisher {
             "Republishing retained charge point snapshots"
         );
         for (id, snapshot) in snapshots {
-            self.publish_charge_point_state(&id, &snapshot).await;
+            self.publish_charge_point_state(&id, &snapshot);
         }
     }
 
-    async fn publish_charge_point_state(
-        &mut self,
-        charge_point_id: &str,
-        snapshot: &ChargePointState,
-    ) {
+    fn publish_charge_point_state(&mut self, charge_point_id: &str, snapshot: &ChargePointState) {
         let topic = charge_point_state_topic(charge_point_id);
         let bytes = match serde_json::to_vec(snapshot) {
             Ok(b) => b,
@@ -814,39 +804,76 @@ impl MqttPublisher {
             }
         };
 
+        self.enqueue(MqttMessage {
+            topic,
+            payload: bytes,
+            qos: QoS::AtLeastOnce,
+            retain: true,
+        });
+    }
+
+    /// Queue a message for publication and push as much as fits.
+    ///
+    /// The single entry point for every publish. While connected, the buffer
+    /// drains straight into the request channel, so in the common case the
+    /// message never waits; while disconnected it stays buffered until the
+    /// next `ConnAck`. Never blocks. Public so that anything holding the
+    /// publisher — a test, or a future caller outside this module — has no
+    /// reason to reach for `client().publish().await` and reintroduce the
+    /// deadlock described in the module docs.
+    pub fn enqueue(&mut self, message: MqttMessage) {
+        self.buffer_message(message);
         if self.state == ConnectionState::Connected {
-            if let Err(e) = self
-                .client
-                .publish(&topic, QoS::AtLeastOnce, true, bytes.clone())
-                .await
-            {
-                warn!(
-                    component = "mqtt",
-                    topic = %topic,
-                    error = %e,
-                    "Failed to publish charge point state, buffering"
-                );
-                self.buffer_message(MqttMessage {
-                    topic,
-                    payload: bytes,
-                    qos: QoS::AtLeastOnce,
-                    retain: true,
-                });
-            } else {
-                debug!(
-                    component = "mqtt",
-                    topic = %topic,
-                    "Published retained charge point state"
-                );
-            }
-        } else {
-            self.buffer_message(MqttMessage {
-                topic,
-                payload: bytes,
-                qos: QoS::AtLeastOnce,
-                retain: true,
-            });
+            self.drain_buffer();
         }
+    }
+
+    /// Hand the front of the buffer to the client until it stops accepting.
+    ///
+    /// `try_publish` fails only when the request channel is full (or the
+    /// event loop is gone, which cannot happen while `self` owns it), so a
+    /// refusal means "wait for `poll()` to make room", and the message stays
+    /// at the front for the next tick. Returns how many were accepted.
+    fn drain_buffer(&mut self) -> usize {
+        let mut accepted = 0;
+        while let Some(msg) = self.buffer.front() {
+            match self
+                .client
+                .try_publish(&msg.topic, msg.qos, msg.retain, msg.payload.clone())
+            {
+                Ok(()) => {
+                    self.buffer.pop_front();
+                    accepted += 1;
+                }
+                Err(_) => {
+                    debug!(
+                        component = "mqtt",
+                        charge_point_id = self.lwt_id(),
+                        waiting = self.buffer.len(),
+                        "MQTT request channel full; the rest drains on the next event-loop tick"
+                    );
+                    break;
+                }
+            }
+        }
+
+        if let Some(published) = self.flush_in_progress {
+            let published = published + accepted;
+            if self.buffer.is_empty() {
+                info!(
+                    component = "mqtt",
+                    charge_point_id = self.lwt_id(),
+                    published = published,
+                    remaining = 0usize,
+                    "Flushed buffered MQTT messages"
+                );
+                self.flush_in_progress = None;
+            } else {
+                self.flush_in_progress = Some(published);
+            }
+        }
+
+        accepted
     }
 
     /// Buffer a message for later publication.
@@ -867,10 +894,13 @@ impl MqttPublisher {
         self.buffer.push_back(message);
     }
 
-    /// Flush buffered messages after reconnection.
+    /// Start flushing the backlog a reconnect found, in FIFO order.
     ///
-    /// Publishes all buffered messages in FIFO order.
-    async fn flush_buffer(&mut self) {
+    /// Logs `Flushing …` now and `Flushed …` when the buffer next runs empty,
+    /// which may be several event-loop ticks later if the backlog is larger
+    /// than the request channel. Never blocks; the old implementation awaited
+    /// each publish here and parked for good once the channel was full.
+    fn flush_buffer(&mut self) {
         let count = self.buffer.len();
         if count == 0 {
             return;
@@ -883,36 +913,8 @@ impl MqttPublisher {
             "Flushing buffered MQTT messages"
         );
 
-        let mut published = 0;
-        while let Some(msg) = self.buffer.pop_front() {
-            if let Err(e) = self
-                .client
-                .publish(&msg.topic, msg.qos, msg.retain, msg.payload.clone())
-                .await
-            {
-                warn!(
-                    component = "mqtt",
-                    charge_point_id = self.lwt_id(),
-                    topic = %msg.topic,
-                    error = %e,
-                    "Failed to publish buffered message, re-buffering"
-                );
-                // Put it back at the front and stop flushing
-                self.buffer.push_front(msg);
-                break;
-            }
-            published += 1;
-        }
-
-        if published > 0 {
-            info!(
-                component = "mqtt",
-                charge_point_id = self.lwt_id(),
-                published = published,
-                remaining = self.buffer.len(),
-                "Flushed buffered MQTT messages"
-            );
-        }
+        self.flush_in_progress = Some(0);
+        self.drain_buffer();
     }
 
     /// Get the current connection state.
@@ -1868,5 +1870,135 @@ mod tests {
         // No extra fields
         let obj = parsed.as_object().unwrap();
         assert_eq!(obj.len(), 3);
+    }
+
+    // ---- non-blocking publishing (regression for the 2026-09-19 deadlock) ----
+    //
+    // None of these tests poll the event loop, on purpose: a request channel
+    // that nobody drains is exactly the condition under which the old code
+    // parked forever, so "returns at all" is the property under test.
+
+    fn publisher_with_events(lwt: Option<&str>) -> (MqttPublisher, mpsc::Sender<MqttEvent>) {
+        let (tx, rx) = mpsc::channel(64);
+        let publisher = MqttPublisher::new(
+            &plaintext_config(),
+            lwt.map(str::to_string),
+            rx,
+            500,
+            SnapshotStore::disabled(),
+        )
+        .expect("publisher");
+        (publisher, tx)
+    }
+
+    fn event_message(i: usize) -> MqttMessage {
+        MqttMessage {
+            topic: format!("ocpp/CP/charger/MeterValues{i}"),
+            payload: vec![i as u8],
+            qos: QoS::AtLeastOnce,
+            retain: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_never_blocks_on_a_full_request_channel() {
+        let (mut publisher, _tx) = publisher_with_events(None);
+        publisher.state = ConnectionState::Connected;
+
+        for i in 0..(REQUEST_CHANNEL_CAPACITY + 5) {
+            publisher.enqueue(event_message(i));
+        }
+
+        // The channel took what it could; the rest waits, in order.
+        assert_eq!(publisher.buffer_len(), 5);
+        assert_eq!(
+            publisher.buffer.front().map(|m| m.topic.as_str()),
+            Some(event_message(REQUEST_CHANNEL_CAPACITY).topic.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_with_a_backlog_larger_than_the_channel_returns() {
+        let (mut publisher, _tx) = publisher_with_events(Some("CP"));
+        publisher.state = ConnectionState::Reconnecting;
+
+        // The incident: the broker bounced with 14 messages buffered.
+        let backlog = REQUEST_CHANNEL_CAPACITY + 4;
+        for i in 0..backlog {
+            publisher.enqueue(event_message(i));
+        }
+        assert_eq!(
+            publisher.buffer_len(),
+            backlog,
+            "not connected: everything is buffered"
+        );
+
+        // 1 online + 14 backlog against a channel of 10. The old handler
+        // awaited the tenth publish here and never came back.
+        time::timeout(Duration::from_secs(2), publisher.on_connack())
+            .await
+            .expect("on_connack must return without the event loop being polled");
+
+        assert_eq!(publisher.state, ConnectionState::Connected);
+        assert_eq!(
+            publisher.buffer_len(),
+            backlog + 1 - REQUEST_CHANNEL_CAPACITY
+        );
+        // online went first, then the oldest nine; the tenth is next in line.
+        assert_eq!(
+            publisher.buffer.front().map(|m| m.topic.as_str()),
+            Some(event_message(REQUEST_CHANNEL_CAPACITY - 1).topic.as_str())
+        );
+        assert!(
+            publisher.flush_in_progress.is_some(),
+            "the flush stays open until the buffer has actually emptied"
+        );
+    }
+
+    #[tokio::test]
+    async fn online_goes_ahead_of_the_backlog() {
+        let (mut publisher, _tx) = publisher_with_events(Some("CP"));
+
+        // Fill the channel so that on_connack can hand nothing over and the
+        // queue it leaves behind shows the order it chose.
+        publisher.state = ConnectionState::Connected;
+        for i in 0..REQUEST_CHANNEL_CAPACITY {
+            publisher.enqueue(event_message(i));
+        }
+        assert_eq!(publisher.buffer_len(), 0);
+
+        publisher.state = ConnectionState::Reconnecting;
+        publisher.enqueue(event_message(99));
+        time::timeout(Duration::from_secs(2), publisher.on_connack())
+            .await
+            .expect("on_connack must return");
+
+        let queued: Vec<&str> = publisher.buffer.iter().map(|m| m.topic.as_str()).collect();
+        assert_eq!(
+            queued,
+            vec!["ocpp/CP/availability", "ocpp/CP/charger/MeterValues99"]
+        );
+        let online = publisher.buffer.front().expect("online is queued");
+        assert_eq!(online.payload, b"online");
+        assert!(online.retain);
+    }
+
+    #[tokio::test]
+    async fn connection_state_is_mirrored_into_the_shared_manager() {
+        let manager = Arc::new(Mutex::new(ConnectionStateManager::new(8)));
+        let (publisher, _tx) = publisher_with_events(Some("CP"));
+        let mut publisher = publisher.with_state_manager(manager.clone());
+
+        publisher.on_connack().await;
+        assert_eq!(
+            manager.lock().await.mqtt_state(),
+            ConnectionState::Connected
+        );
+
+        publisher.set_state(ConnectionState::Reconnecting).await;
+        assert_eq!(
+            manager.lock().await.mqtt_state(),
+            ConnectionState::Reconnecting
+        );
     }
 }

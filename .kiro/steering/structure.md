@@ -32,7 +32,7 @@ ocpp-proxy/
 - **downstream**: Accepts charger WebSocket connections, validates `ocpp1.6` subprotocol, handles connection replacement for same Charge Point ID, routes received messages to forwarder channel.
 - **upstream**: Manages WebSocket client to Central System with 10s connect timeout, exponential backoff reconnection (2s–60s), 5-minute reconnection window.
 - **forwarder**: Priority forwarding path. Sends raw bytes to sink, tracks Call→Response correlation, buffers when destination unavailable, emits MQTT events after forwarding.
-- **mqtt**: Runs on a dedicated OS thread (rumqttc EventLoop is not Send). Publishes to `ocpp/{charge_point_id}/{direction}/{action}` topics. Buffers when broker unreachable.
+- **mqtt**: Runs on a dedicated OS thread (rumqttc EventLoop is not Send). Publishes to `ocpp/{charge_point_id}/{direction}/{action}` topics. Buffers when broker unreachable. Never awaits a publish: everything goes through the FIFO buffer and `try_publish`, drained on each event-loop tick, because an awaited publish from the task that drives `poll()` deadlocks once the request channel is full. Mirrors its connection state into the shared `ConnectionStateManager` for `/health`.
 - **state**: Central state manager with broadcast channel for state change events. Computes health: healthy (all connected), degraded (MQTT down), unhealthy (upstream or downstream down).
 - **models**: Domain types. OcppFrame preserves raw JSON. ExponentialBackoff used by both upstream and MQTT.
 - **error**: Single ProxyError enum with variants per category (connection_downstream, connection_upstream, connection_mqtt, forwarding, config, protocol, tls).
