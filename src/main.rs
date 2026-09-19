@@ -150,7 +150,11 @@ async fn main() {
                     mqtt_buffer_size,
                     snapshot_store,
                 ) {
-                    Ok(p) => p,
+                    // The publisher owns the `mqtt` entry in the shared state
+                    // from here on: every ConnAck and every lost connection
+                    // is mirrored there, so `/health` tracks the event loop
+                    // rather than the startup result.
+                    Ok(p) => p.with_state_manager(state_for_mqtt.clone()),
                     Err(e) => {
                         error!(component = "mqtt", error = %e, "MQTT publisher unavailable; \
                                proxying continues without Home Assistant visibility");
@@ -166,9 +170,15 @@ async fn main() {
                 // 10-second attempt. The tokio runtime waits for blocking
                 // tasks on drop, so a join timeout in `main` cannot rescue us
                 // here — the thread has to notice for itself.
-                let connected = tokio::select! {
+                tokio::select! {
                     result = publisher.try_connect(MQTT_STARTUP_TIMEOUT) => {
-                        result.unwrap_or(false)
+                        if let Err(e) = result {
+                            warn!(
+                                component = "mqtt",
+                                error = %e,
+                                "MQTT startup connect failed; the event loop keeps retrying"
+                            );
+                        }
                     }
                     _ = mqtt_shutdown.cancelled() => {
                         info!(
@@ -177,17 +187,6 @@ async fn main() {
                         );
                         return;
                     }
-                };
-                {
-                    let mut mgr = state_for_mqtt.lock().await;
-                    mgr.transition(
-                        ConnectionId::Mqtt,
-                        if connected {
-                            ConnectionState::Connected
-                        } else {
-                            ConnectionState::Reconnecting
-                        },
-                    );
                 }
 
                 // `run` returns when every sender is dropped. The token is a
