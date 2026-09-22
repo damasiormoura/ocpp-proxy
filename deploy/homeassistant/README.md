@@ -85,7 +85,9 @@ mains meter. The dashboard's *Load balancing* cards expect that package to
 exist under fixed entity names — `input_boolean.ev_load_balancing`,
 `sensor.ev_available_current`, `sensor.house_power_excluding_charger`, the
 `input_number.ev_*` knobs and the `automation.ev_load_balancing_*`
-automations — and read "entity not found" without it. The recipe: `available = (contracted_power − reserve − house_without_charger)
+automations — and read "entity not found" without it. The house figure is
+apparent power in VA, since contracts and meter limiters are in kVA; it reads
+above the active-power sensor by the power factor. The recipe: `available = (contracted_power − reserve − house_without_charger)
 / 230 V`, clamped to a ceiling, and `0` when under 6 A. Reduce at once,
 raise only after a couple of minutes of spare headroom, and stop touching it
 when the house sensor is unavailable. The entity names for the meters are
