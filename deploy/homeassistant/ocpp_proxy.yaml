@@ -314,22 +314,23 @@ mqtt:
       availability: *proxy_availability
       device: *charger_device
 
-    # What the charger is offering the car, if it reports Current.Offered in
-    # MeterValues (not every firmware does; add it to MeterValuesSampledData
-    # with change_configuration if not). The direct evidence that a limit took.
-    - name: "Charger Current Offered"
-      unique_id: ocpp_charger_current_offered
+    # What the charger is offering the car. This Autel reports the offer as
+    # Power.Offered (W), not Current.Offered — seen live 2026-09-22 — so that
+    # is the measurand read here. The direct evidence that a limit took:
+    # 20 A on one phase should show as roughly 4600 W while the car draws.
+    - name: "Charger Power Offered"
+      unique_id: ocpp_charger_power_offered
       state_topic: "ocpp/@CHARGE_POINT_ID@/charger/MeterValues"
-      device_class: current
+      device_class: power
       state_class: measurement
-      unit_of_measurement: "A"
+      unit_of_measurement: "W"
       value_template: >-
         {% set sv = value_json.payload[3].meterValue | default([], true) | last %}
         {% set vals = (sv.sampledValue | default([], true))
              | selectattr('measurand', 'defined')
-             | selectattr('measurand', 'eq', 'Current.Offered')
+             | selectattr('measurand', 'eq', 'Power.Offered')
              | map(attribute='value') | list %}
-        {{ (vals[0] | float(0)) | round(1) if vals else this.state }}
+        {{ (vals[0] | float(0)) | round(0) | int if vals else this.state }}
       availability: *proxy_availability
       device: *charger_device
 

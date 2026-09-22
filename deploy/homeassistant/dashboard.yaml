@@ -182,7 +182,7 @@ views:
             name: Current limit (0 = pause)
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_limit_status
             name: Last limit command
-          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_offered
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_power_offered
             name: Offered to the car
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
             name: Actually drawn

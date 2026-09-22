@@ -44,7 +44,7 @@ broker configuration is needed.
 | `binary_sensor.${CHARGE_POINT_SLUG}_ocpp_proxy_online` | `availability` | driven by the MQTT Last Will |
 | `number.${CHARGE_POINT_SLUG}_charger_current_limit` | `state` ← / → `command/current_limit` | the charging-current limit, A; 0 pauses |
 | `sensor.${CHARGE_POINT_SLUG}_charger_current_limit_status` | `state` | accepted / rejected / error / timeout / none |
-| `sensor.${CHARGE_POINT_SLUG}_charger_current_offered` | `charger/MeterValues` | `Current.Offered`, if the charger reports it |
+| `sensor.${CHARGE_POINT_SLUG}_charger_power_offered` | `charger/MeterValues` | `Power.Offered`, W — the measurand this charger actually reports for its offer |
 | `sensor.${CHARGE_POINT_SLUG}_charger_last_command` | `command/result` | status; the whole result as attributes |
 | `button.${CHARGE_POINT_SLUG}_charger_clear_current_limit` | → `command` | `clear_current_limit` |
 | `button.${CHARGE_POINT_SLUG}_charger_read_configuration` | → `command` | `get_configuration`; answer in the last-command attributes |
@@ -53,6 +53,12 @@ broker configuration is needed.
 The control entities need the proxy deployed with `charging.enabled: true`
 (see the repository README, *Charger control*). Without it the number publishes
 into the void and the status sensor reads `none`, which is accurate.
+
+The first deployed version of this package (22 Sep 2026) carried a
+`…_charger_current_offered` sensor reading `Current.Offered`, which this
+charger never sends; it was replaced by the power sensor above. Home Assistant
+keeps the old entity in its registry as unavailable until it is deleted from
+Settings → Entities.
 
 ## Setting the charging current
 
