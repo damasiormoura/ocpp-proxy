@@ -232,10 +232,14 @@ keeping the old figure.
 ### First use
 
 1. Enable `charging` with a conservative `max_limit_a` and deploy.
-2. Publish `{"command": "get_configuration"}` and read the result. Confirm
-   `SupportedFeatureProfiles` contains `SmartCharging`, note
-   `ChargingScheduleAllowedChargingRateUnit` (if it is `Power` only, set
-   `rate_unit: W`) and `ChargeProfileMaxStackLevel`.
+2. Publish `{"command": "get_composite_schedule"}`. A charger that answers
+   `Accepted` with a schedule supports SmartCharging, and the schedule is
+   the ceiling it applies today — the Autel MaxiCharger this was built
+   against reported 28 A on connector 0, single phase, before any proxy
+   profile existed. `{"command": "get_configuration"}` is the textbook
+   probe (`SupportedFeatureProfiles`, `ChargingScheduleAllowedChargingRateUnit`,
+   `ChargeProfileMaxStackLevel`), but that same Autel answers it with an
+   empty `{}`, keys named or not, so do not rely on it alone.
 3. With a car charging, set a limit below the current draw and watch
    `Power.Active.Import` in `MeterValues` fall within a few seconds. If the
    charger answers `Rejected` or `NotSupported`, try
