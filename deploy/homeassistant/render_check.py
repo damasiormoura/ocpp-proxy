@@ -33,6 +33,8 @@ AFTER_SESSION = {
     "last_meter_stop_wh": 8084000, "last_session_energy_wh": 7555,
     "last_transaction_id": 1000000001, "last_stop_reason": "EVDisconnected",
     "last_stop_time": "2026-09-01T07:22:16Z",
+    "current_limit_a": None, "current_limit_status": None,
+    "current_limit_updated": None,
     "last_updated": "2026-09-01T07:22:16+00:00",
 }
 MID_SESSION = dict(AFTER_SESSION, connector_status="Charging",
@@ -44,6 +46,12 @@ FRESH.update(connector_status="Available", error_code="NoError")
 LEGACY = {k: v for k, v in FRESH.items() if not k.startswith("last_") or k == "last_updated"}
 # A stop the proxy saw without the matching start.
 NO_DELTA = dict(AFTER_SESSION, last_session_energy_wh=None, last_stop_reason=None)
+# A standing 16 A limit, a paused charger (0 A — must NOT read as "no limit"),
+# and a limit the charger refused, where the previous one still stands.
+LIMITED = dict(MID_SESSION, current_limit_a=16.0, current_limit_status="accepted",
+               current_limit_updated="2026-09-22T18:00:00+00:00")
+PAUSED = dict(LIMITED, current_limit_a=0)
+REFUSED = dict(LIMITED, current_limit_status="rejected")
 
 pkg = yaml.safe_load(open(PKG))
 sensors = {s["name"]: s for s in pkg["mqtt"]["sensor"]}
@@ -91,6 +99,22 @@ CASES = [
     ("Charger Status",                 AFTER_SESSION, "online",  "Available"),
     ("Charger Transaction ID",         AFTER_SESSION, "online",  "none"),
     ("Charger Transaction ID",         MID_SESSION,   "online",  "1000000002"),
+
+    # The limit status: `none` until a limit command has ever run, including
+    # on a snapshot from before the feature existed.
+    ("Charger Current Limit Status",   AFTER_SESSION, "online",  "none"),
+    ("Charger Current Limit Status",   LEGACY,        "online",  "none"),
+    ("Charger Current Limit Status",   LIMITED,       "online",  "accepted"),
+    ("Charger Current Limit Status",   REFUSED,       "online",  "rejected"),
+]
+
+# The `number` entity's template: the standing limit, or "None" (its
+# payload_reset) when there is none — including on a legacy snapshot.
+NUMBER_CASES = [
+    ("Charger Current Limit", LIMITED, "16.0"),
+    ("Charger Current Limit", PAUSED,  "0"),
+    ("Charger Current Limit", AFTER_SESSION, "None"),
+    ("Charger Current Limit", LEGACY,  "None"),
 ]
 
 fails = 0
@@ -100,7 +124,8 @@ for name, payload, want_avail, want_state in CASES:
     got_state = render(s["value_template"], payload)
     label = {id(AFTER_SESSION): "after", id(MID_SESSION): "mid",
              id(FRESH): "fresh", id(LEGACY): "legacy",
-             id(NO_DELTA): "no-delta"}[id(payload)]
+             id(NO_DELTA): "no-delta", id(LIMITED): "limited",
+             id(REFUSED): "refused"}[id(payload)]
     ok = got_avail == want_avail and (want_state is None or got_state == want_state)
     if not ok:
         fails += 1
@@ -108,5 +133,17 @@ for name, payload, want_avail, want_state in CASES:
         "PASS" if ok else "FAIL", name, label, got_avail, got_state,
         "" if ok else "   WANTED avail=%s state=%s" % (want_avail, want_state)))
 
-print("\n%d cases, %d failures" % (len(CASES), fails))
+numbers = {n["name"]: n for n in pkg["mqtt"].get("number", [])}
+for name, payload, want_state in NUMBER_CASES:
+    got_state = render(numbers[name]["value_template"], payload)
+    ok = got_state == want_state
+    if not ok:
+        fails += 1
+    label = {id(LIMITED): "limited", id(PAUSED): "paused",
+             id(AFTER_SESSION): "after", id(LEGACY): "legacy"}[id(payload)]
+    print("%-4s %-34s %-9s state=%s%s" % (
+        "PASS" if ok else "FAIL", name, label, got_state,
+        "" if ok else "   WANTED state=%s" % want_state))
+
+print("\n%d cases, %d failures" % (len(CASES) + len(NUMBER_CASES), fails))
 sys.exit(1 if fails else 0)

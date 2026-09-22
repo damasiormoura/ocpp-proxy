@@ -26,9 +26,16 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::command::{
+    self, CommandRequest, CommandResult, CommandStatus, InFlight, LocalCallQueue,
+    CENTRAL_CALL_GRACE, COMMAND_CHANNEL_CAPACITY,
+};
+use crate::config::ChargingConfig;
 use crate::error::ProxyError;
 use crate::forwarder::{MessageForwarder, MessageSink, MqttEvent};
-use crate::models::{ConnectionId, ConnectionState, Direction, ExponentialBackoff, OcppFrame};
+use crate::models::{
+    ConnectionId, ConnectionState, Direction, ExponentialBackoff, OcppFrame, OcppMessageType,
+};
 use crate::state::ConnectionStateManager;
 use crate::upstream::{build_upstream_url, connect_upstream};
 
@@ -62,6 +69,10 @@ pub struct SessionConfig {
     pub max_reconnect_window: Duration,
     /// Maximum age of a tracked Call awaiting its response.
     pub call_tracker_max_age: Duration,
+    /// Proxy-originated charger commands. Only the timeout and the profile
+    /// shape are read here; whether commands arrive at all is decided by the
+    /// MQTT publisher, which subscribes only when `charging.enabled` is set.
+    pub charging: ChargingConfig,
 }
 
 /// Sends OCPP frames to the charger through the downstream writer task.
@@ -120,6 +131,7 @@ pub async fn run_session(
     state: Arc<Mutex<ConnectionStateManager>>,
     mqtt_tx: mpsc::Sender<MqttEvent>,
     cancel: CancellationToken,
+    mut command_rx: mpsc::Receiver<CommandRequest>,
 ) {
     let (ws_sink, mut ws_stream) = ws.split();
 
@@ -139,6 +151,12 @@ pub async fn run_session(
     let mut backoff = ExponentialBackoff::with_defaults(config.initial_backoff, config.max_backoff);
     let mut reconnecting_since: Option<tokio::time::Instant> = None;
     let mut close_code = CLOSE_NORMAL;
+
+    // Proxy-originated Calls live for the whole session, across upstream
+    // reconnects: the charger connection they travel on is the same one.
+    let mut local_calls =
+        LocalCallQueue::new(config.charging.command_timeout(), COMMAND_CHANNEL_CAPACITY);
+    let mut commands_open = true;
 
     'session: loop {
         // ---- connect (or reconnect) upstream ----
@@ -279,6 +297,10 @@ pub async fn run_session(
             &state,
             &cancel,
             &config,
+            &mqtt_tx,
+            &mut command_rx,
+            &mut commands_open,
+            &mut local_calls,
         )
         .await;
 
@@ -328,6 +350,44 @@ pub async fn run_session(
     }
 
     // Requirement 9.4 / 2.6 — a close frame, not a dropped socket.
+    // Nothing the proxy was asked can be delivered now; say so rather than
+    // leaving the caller waiting on a result that never comes.
+    let (queued, in_flight) = local_calls.drain();
+    for request in queued {
+        emit_command_result(
+            &mqtt_tx,
+            &charge_point_id,
+            CommandResult::for_request(
+                &request,
+                CommandStatus::NotConnected,
+                Some("charger session ended before the command was sent".to_string()),
+            ),
+        );
+    }
+    if let Some(in_flight) = in_flight {
+        emit_command_result(
+            &mqtt_tx,
+            &charge_point_id,
+            CommandResult::for_in_flight(
+                &in_flight,
+                CommandStatus::Timeout,
+                None,
+                Some("charger session ended before it answered".to_string()),
+            ),
+        );
+    }
+    while let Ok(request) = command_rx.try_recv() {
+        emit_command_result(
+            &mqtt_tx,
+            &charge_point_id,
+            CommandResult::for_request(
+                &request,
+                CommandStatus::NotConnected,
+                Some("charger session ended before the command was sent".to_string()),
+            ),
+        );
+    }
+
     let _ = charger_tx
         .send(AxumMessage::Close(Some(CloseFrame {
             code: close_code,
@@ -366,12 +426,22 @@ async fn forward_loop(
     state: &Arc<Mutex<ConnectionStateManager>>,
     cancel: &CancellationToken,
     config: &SessionConfig,
+    mqtt_tx: &mpsc::Sender<MqttEvent>,
+    command_rx: &mut mpsc::Receiver<CommandRequest>,
+    commands_open: &mut bool,
+    local: &mut LocalCallQueue,
 ) -> LoopOutcome {
     // Housekeeping the previous implementation declared but never ran: without
     // it the buffers ignore their age limit and the call tracker grows without
     // bound for the lifetime of the process.
     let mut housekeeping = tokio::time::interval(Duration::from_secs(10));
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Proxy commands time out on their own clock, finer than housekeeping's,
+    // so a controller learns of an unanswered Call within a second of the
+    // deadline rather than up to ten later.
+    let mut command_tick = tokio::time::interval(Duration::from_secs(1));
+    command_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -381,11 +451,42 @@ async fn forward_loop(
                     Some(Ok(AxumMessage::Text(text))) => {
                         match OcppFrame::parse(&text) {
                             Ok(frame) => {
+                                // The charger answering a question the proxy asked.
+                                // Consumed here: the Central System never asked it,
+                                // and must not see a reply to it.
+                                if !matches!(frame.message_type, OcppMessageType::Call { .. }) {
+                                    if let Some(in_flight) = local.take_response(&frame.unique_id) {
+                                        complete_local_call(charge_point_id, mqtt_tx, in_flight, &frame);
+                                        if send_local_calls(
+                                            charge_point_id, forwarder, local, &config.charging,
+                                            charger_tx, mqtt_tx,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            return LoopOutcome::ChargerGone;
+                                        }
+                                        continue;
+                                    }
+                                }
+
                                 let mut sink = UpstreamSink { sink: up_sink };
                                 match forwarder.forward_upstream(frame, &mut sink).await {
                                     Ok(()) => {
                                         state.lock().await
                                             .record_forwarded(Direction::ChargerToCentral);
+                                        // A charger response may have cleared the line
+                                        // for a proxy Call that was waiting on it.
+                                        if !local.is_empty()
+                                            && send_local_calls(
+                                                charge_point_id, forwarder, local,
+                                                &config.charging, charger_tx, mqtt_tx,
+                                            )
+                                            .await
+                                            .is_err()
+                                        {
+                                            return LoopOutcome::ChargerGone;
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(
@@ -514,6 +615,103 @@ async fn forward_loop(
             }
 
             // ---- periodic housekeeping ----
+            command = command_rx.recv(), if *commands_open => {
+                match command {
+                    Some(request) => {
+                        info!(
+                            component = "session",
+                            charge_point_id = %charge_point_id,
+                            command_id = %request.id,
+                            action = request.command.action(),
+                            source = ?request.source,
+                            "Proxy command received"
+                        );
+                        for displaced in local.push(request) {
+                            let (status, detail) = if displaced.command.is_limit_command() {
+                                (
+                                    CommandStatus::Superseded,
+                                    "a newer limit command arrived before this one was sent",
+                                )
+                            } else {
+                                (CommandStatus::Rejected, "command queue full; oldest dropped")
+                            };
+                            emit_command_result(
+                                mqtt_tx,
+                                charge_point_id,
+                                CommandResult::for_request(&displaced, status, Some(detail.to_string())),
+                            );
+                        }
+                        if send_local_calls(
+                            charge_point_id, forwarder, local, &config.charging, charger_tx, mqtt_tx,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return LoopOutcome::ChargerGone;
+                        }
+                    }
+                    None => {
+                        // The router dropped our sender (a newer connection for
+                        // this id took over). Stop polling a closed channel.
+                        *commands_open = false;
+                    }
+                }
+            }
+
+            _ = command_tick.tick(), if !local.is_empty() => {
+                let timeout_s = config.charging.command_timeout_seconds;
+                let (expired, in_flight) = local.expire(chrono::Utc::now());
+                for request in expired {
+                    warn!(
+                        component = "session",
+                        charge_point_id = %charge_point_id,
+                        command_id = %request.id,
+                        "Proxy command not sent within the timeout; dropping it"
+                    );
+                    emit_command_result(
+                        mqtt_tx,
+                        charge_point_id,
+                        CommandResult::for_request(
+                            &request,
+                            CommandStatus::Timeout,
+                            Some(format!(
+                                "not sent within {} s (the charger was busy answering the \
+                                 Central System, or the line was down)",
+                                timeout_s
+                            )),
+                        ),
+                    );
+                }
+                if let Some(in_flight) = in_flight {
+                    warn!(
+                        component = "session",
+                        charge_point_id = %charge_point_id,
+                        command_id = %in_flight.request.id,
+                        unique_id = %in_flight.prepared.unique_id,
+                        action = in_flight.prepared.action,
+                        "Charger did not answer the proxy's Call within the timeout"
+                    );
+                    emit_command_result(
+                        mqtt_tx,
+                        charge_point_id,
+                        CommandResult::for_in_flight(
+                            &in_flight,
+                            CommandStatus::Timeout,
+                            None,
+                            Some(format!("no answer from the charger within {} s", timeout_s)),
+                        ),
+                    );
+                }
+                if send_local_calls(
+                    charge_point_id, forwarder, local, &config.charging, charger_tx, mqtt_tx,
+                )
+                .await
+                .is_err()
+                {
+                    return LoopOutcome::ChargerGone;
+                }
+            }
+
             _ = housekeeping.tick() => {
                 let expired = forwarder.evict_expired_messages();
                 let stale_calls = forwarder.cleanup_expired_calls();
@@ -538,6 +736,136 @@ async fn forward_loop(
                 return LoopOutcome::Shutdown;
             }
         }
+    }
+}
+
+/// Send the next queued proxy Call if the line is clear: nothing of ours in
+/// flight, and no recent Central System Call still awaiting the charger's
+/// answer. `Err` means the charger connection is gone.
+async fn send_local_calls(
+    charge_point_id: &str,
+    forwarder: &MessageForwarder,
+    local: &mut LocalCallQueue,
+    charging: &ChargingConfig,
+    charger_tx: &mpsc::Sender<AxumMessage>,
+    mqtt_tx: &mpsc::Sender<MqttEvent>,
+) -> Result<(), ()> {
+    if local.has_in_flight() || local.is_empty() {
+        return Ok(());
+    }
+    if forwarder.has_recent_pending_call(Direction::CentralToCharger, CENTRAL_CALL_GRACE) {
+        debug!(
+            component = "session",
+            charge_point_id = %charge_point_id,
+            queued = local.queued_len(),
+            "Holding proxy command: the Central System has a Call outstanding with the charger"
+        );
+        return Ok(());
+    }
+
+    while let Some(request) = local.pop_next() {
+        let unique_id = local.next_unique_id();
+        match command::prepare_call(charging, &request, unique_id, chrono::Utc::now()) {
+            Err(reason) => {
+                warn!(
+                    component = "session",
+                    charge_point_id = %charge_point_id,
+                    command_id = %request.id,
+                    reason = %reason,
+                    "Proxy command rejected before sending"
+                );
+                emit_command_result(
+                    mqtt_tx,
+                    charge_point_id,
+                    CommandResult::for_request(&request, CommandStatus::Invalid, Some(reason)),
+                );
+            }
+            Ok(prepared) => {
+                info!(
+                    component = "session",
+                    charge_point_id = %charge_point_id,
+                    command_id = %request.id,
+                    unique_id = %prepared.unique_id,
+                    action = prepared.action,
+                    applied_limit_a = ?prepared.applied_limit_a,
+                    "Sending proxy-originated Call to the charger"
+                );
+                let mut sink = ChargerSink {
+                    tx: charger_tx.clone(),
+                };
+                if sink.send_raw(&prepared.raw).await.is_err() {
+                    emit_command_result(
+                        mqtt_tx,
+                        charge_point_id,
+                        CommandResult::for_request(
+                            &request,
+                            CommandStatus::NotConnected,
+                            Some(
+                                "charger connection closed before the command was sent".to_string(),
+                            ),
+                        ),
+                    );
+                    return Err(());
+                }
+                local.set_in_flight(request, prepared);
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The charger answered one of our Calls: read the answer and report it.
+fn complete_local_call(
+    charge_point_id: &str,
+    mqtt_tx: &mpsc::Sender<MqttEvent>,
+    in_flight: InFlight,
+    frame: &OcppFrame,
+) {
+    let (status, response, detail) = command::interpret_response(in_flight.prepared.action, frame);
+    if status == CommandStatus::Accepted {
+        info!(
+            component = "session",
+            charge_point_id = %charge_point_id,
+            command_id = %in_flight.request.id,
+            action = in_flight.prepared.action,
+            applied_limit_a = ?in_flight.prepared.applied_limit_a,
+            detail = detail.as_deref().unwrap_or(""),
+            "Charger accepted the proxy's Call"
+        );
+    } else {
+        warn!(
+            component = "session",
+            charge_point_id = %charge_point_id,
+            command_id = %in_flight.request.id,
+            action = in_flight.prepared.action,
+            status = status.as_str(),
+            detail = detail.as_deref().unwrap_or(""),
+            "Charger did not accept the proxy's Call"
+        );
+    }
+    emit_command_result(
+        mqtt_tx,
+        charge_point_id,
+        CommandResult::for_in_flight(&in_flight, status, response, detail),
+    );
+}
+
+fn emit_command_result(
+    mqtt_tx: &mpsc::Sender<MqttEvent>,
+    charge_point_id: &str,
+    result: CommandResult,
+) {
+    if let Err(e) = mqtt_tx.try_send(MqttEvent::CommandResult {
+        charge_point_id: charge_point_id.to_string(),
+        result,
+    }) {
+        warn!(
+            component = "session",
+            charge_point_id = %charge_point_id,
+            error = %e,
+            "Could not queue a command result for MQTT; the caller will not hear back"
+        );
     }
 }
 

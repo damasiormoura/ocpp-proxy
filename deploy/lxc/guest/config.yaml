@@ -76,3 +76,33 @@ buffers:
   message_buffer_size: 100
   mqtt_buffer_size: 500
   max_backoff_seconds: 60
+
+# --- Charger control -------------------------------------------------------
+# The proxy's own OCPP commands towards the charger: a charging-current limit
+# set from Home Assistant (number.<slug>_charger_current_limit), plus reading
+# the charger's configuration. See README.md, "Charger control".
+#
+# Enabled here because that is what this deployment is for. Two things to
+# know before relying on it:
+#
+#   * The broker accepts anonymous connections (deliberately — see
+#     deploy/lxc/README.md). Anyone who can reach EMQX can therefore publish
+#     a limit. The ceiling below bounds the damage to "the car charges slower
+#     or pauses". To lock it down, add an EMQX ACL denying publish on
+#     ocpp/+/command/# to all but the Home Assistant user.
+#
+#   * max_limit_a is a hard ceiling, not the working limit. It sits well under
+#     the 30 A a 6.9 kVA single-phase contract allows in total, so that even
+#     a controller asking for "everything" leaves 2.3 kW for the house. The
+#     working limit is whatever Home Assistant sets, dynamically or by hand.
+charging:
+  enabled: true
+  max_limit_a: 20
+  min_limit_a: 6
+  connector_id: 0
+  purpose: TxDefaultProfile
+  profile_kind: Absolute
+  rate_unit: A
+  number_phases: 1
+  command_timeout_seconds: 30
+  reapply_on_connect: true

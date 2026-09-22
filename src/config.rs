@@ -96,6 +96,11 @@ pub struct ProxyConfig {
     /// session ends — see `snapshot_store`.
     #[serde(default = "default_state_file")]
     pub state_file: String,
+    /// Locally originated charger commands (SetChargingProfile and friends).
+    /// Disabled unless `charging.enabled` is set: the proxy is transparent by
+    /// default and only speaks OCPP itself when asked to.
+    #[serde(default)]
+    pub charging: ChargingConfig,
 }
 
 /// Matches `StateDirectory=ocpp-proxy` in the systemd unit, which creates the
@@ -174,6 +179,258 @@ impl Default for BufferConfig {
 ///
 /// Exists only so that every missing required parameter can be reported at
 /// once, rather than serde stopping at the first one.
+/// Which OCPP charging-profile purpose the current limit is sent as.
+///
+/// `TxDefaultProfile` is the widely supported choice: it applies to every
+/// transaction on the connector (connector 0 = all connectors) and yields to a
+/// `TxProfile` the Central System might install, which is the right precedence
+/// for a limit the site owner sets underneath the operator. `ChargePointMaxProfile`
+/// is semantically a site limit and takes precedence over everything, but some
+/// chargers reject it — check `SupportedFeatureProfiles` and try.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub enum ChargingProfilePurpose {
+    ChargePointMaxProfile,
+    TxDefaultProfile,
+}
+
+impl ChargingProfilePurpose {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChargingProfilePurpose::ChargePointMaxProfile => "ChargePointMaxProfile",
+            ChargingProfilePurpose::TxDefaultProfile => "TxDefaultProfile",
+        }
+    }
+}
+
+/// `Absolute` schedules carry a `startSchedule` timestamp (the proxy uses
+/// "now"), which every charger interprets the same way. `Relative` schedules
+/// start at a charger-defined moment, which for a limit sent mid-transaction
+/// varies by firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub enum ChargingProfileKind {
+    Absolute,
+    Relative,
+}
+
+impl ChargingProfileKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChargingProfileKind::Absolute => "Absolute",
+            ChargingProfileKind::Relative => "Relative",
+        }
+    }
+}
+
+/// Unit the limit is expressed in on the wire. Commands always take amps; with
+/// `W` the proxy converts using `nominal_voltage_v` and `number_phases`, for
+/// chargers whose `ChargingScheduleAllowedChargingRateUnit` is `Power` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub enum ChargingRateUnit {
+    A,
+    W,
+}
+
+impl ChargingRateUnit {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChargingRateUnit::A => "A",
+            ChargingRateUnit::W => "W",
+        }
+    }
+}
+
+fn default_max_limit_a() -> f64 {
+    32.0
+}
+
+fn default_min_limit_a() -> f64 {
+    6.0
+}
+
+fn default_profile_id() -> i64 {
+    1001
+}
+
+fn default_purpose() -> ChargingProfilePurpose {
+    ChargingProfilePurpose::TxDefaultProfile
+}
+
+fn default_profile_kind() -> ChargingProfileKind {
+    ChargingProfileKind::Absolute
+}
+
+fn default_rate_unit() -> ChargingRateUnit {
+    ChargingRateUnit::A
+}
+
+fn default_number_phases() -> Option<u32> {
+    Some(1)
+}
+
+fn default_nominal_voltage() -> f64 {
+    230.0
+}
+
+fn default_command_timeout() -> u64 {
+    30
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Configuration keys `change_configuration` may touch unless overridden. These
+/// are the ones a load controller has a reason to change (how often and what
+/// the charger reports in MeterValues). Anything that could alter how the
+/// charger reaches or authorises with the Central System is deliberately absent.
+fn default_allowed_configuration_keys() -> Vec<String> {
+    [
+        "MeterValueSampleInterval",
+        "MeterValuesSampledData",
+        "ClockAlignedDataInterval",
+        "MeterValuesAlignedData",
+        "StopTxnSampledData",
+        "StopTxnAlignedData",
+    ]
+    .iter()
+    .map(|k| k.to_string())
+    .collect()
+}
+
+/// Settings for the proxy's own OCPP commands towards the charger.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ChargingConfig {
+    /// Master switch. Off: the proxy never subscribes to the command topics
+    /// and never originates an OCPP message.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ceiling on any limit the proxy will send, in amps. Requests above it
+    /// are clamped, and the result says so. Set it under the site's contracted
+    /// current so a misbehaving controller cannot ask for more than the mains
+    /// can give.
+    #[serde(default = "default_max_limit_a")]
+    pub max_limit_a: f64,
+    /// Lowest current an EV will actually charge at (IEC 61851: 6 A). A request
+    /// below this is sent as 0 A, which pauses charging rather than asking for
+    /// a current the car would refuse.
+    #[serde(default = "default_min_limit_a")]
+    pub min_limit_a: f64,
+    /// Connector the profile is installed on. 0 = the whole charge point.
+    #[serde(default)]
+    pub connector_id: u32,
+    /// `chargingProfileId` the proxy owns. The same id is reused on every set
+    /// (replacing the previous limit) and named on clear. Kept away from the
+    /// low numbers a Central System is likely to use for its own profiles.
+    #[serde(default = "default_profile_id")]
+    pub profile_id: i64,
+    #[serde(default)]
+    pub stack_level: u32,
+    #[serde(default = "default_purpose")]
+    pub purpose: ChargingProfilePurpose,
+    #[serde(default = "default_profile_kind")]
+    pub profile_kind: ChargingProfileKind,
+    #[serde(default = "default_rate_unit")]
+    pub rate_unit: ChargingRateUnit,
+    /// `numberPhases` on the schedule period. `null` omits the field.
+    #[serde(default = "default_number_phases")]
+    pub number_phases: Option<u32>,
+    /// Used only to convert amps to watts when `rate_unit` is `W`.
+    #[serde(default = "default_nominal_voltage")]
+    pub nominal_voltage_v: f64,
+    /// How long a command may wait — queued or awaiting the charger's answer —
+    /// before it is reported as timed out.
+    #[serde(default = "default_command_timeout")]
+    pub command_timeout_seconds: u64,
+    /// Re-send the last accepted limit whenever the charger (re)connects, so a
+    /// charger reboot that forgets its profiles does not silently return to
+    /// full current.
+    #[serde(default = "default_true")]
+    pub reapply_on_connect: bool,
+    #[serde(default = "default_allowed_configuration_keys")]
+    pub allowed_configuration_keys: Vec<String>,
+}
+
+impl Default for ChargingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_limit_a: default_max_limit_a(),
+            min_limit_a: default_min_limit_a(),
+            connector_id: 0,
+            profile_id: default_profile_id(),
+            stack_level: 0,
+            purpose: default_purpose(),
+            profile_kind: default_profile_kind(),
+            rate_unit: default_rate_unit(),
+            number_phases: default_number_phases(),
+            nominal_voltage_v: default_nominal_voltage(),
+            command_timeout_seconds: default_command_timeout(),
+            reapply_on_connect: true,
+            allowed_configuration_keys: default_allowed_configuration_keys(),
+        }
+    }
+}
+
+impl ChargingConfig {
+    pub fn command_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.command_timeout_seconds)
+    }
+
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.max_limit_a.is_finite() || self.max_limit_a <= 0.0 || self.max_limit_a > 80.0 {
+            errors.push(format!(
+                "charging.max_limit_a must be between 0 and 80 (amps), got: {}",
+                self.max_limit_a
+            ));
+        }
+        if !self.min_limit_a.is_finite() || self.min_limit_a < 0.0 {
+            errors.push(format!(
+                "charging.min_limit_a must be zero or positive, got: {}",
+                self.min_limit_a
+            ));
+        }
+        if self.min_limit_a > self.max_limit_a {
+            errors.push(format!(
+                "charging.min_limit_a ({}) must not exceed charging.max_limit_a ({})",
+                self.min_limit_a, self.max_limit_a
+            ));
+        }
+        if self.profile_id <= 0 {
+            errors.push(format!(
+                "charging.profile_id must be a positive integer, got: {}",
+                self.profile_id
+            ));
+        }
+        if self.purpose == ChargingProfilePurpose::ChargePointMaxProfile && self.connector_id != 0 {
+            errors.push(format!(
+                "charging.connector_id must be 0 for ChargePointMaxProfile, got: {}",
+                self.connector_id
+            ));
+        }
+        if matches!(self.number_phases, Some(0) | Some(4..)) {
+            errors.push(format!(
+                "charging.number_phases must be 1, 2, 3 or null, got: {:?}",
+                self.number_phases
+            ));
+        }
+        if !self.nominal_voltage_v.is_finite() || !(100.0..=480.0).contains(&self.nominal_voltage_v)
+        {
+            errors.push(format!(
+                "charging.nominal_voltage_v must be between 100 and 480, got: {}",
+                self.nominal_voltage_v
+            ));
+        }
+        if !(1..=300).contains(&self.command_timeout_seconds) {
+            errors.push(format!(
+                "charging.command_timeout_seconds must be between 1 and 300, got: {}",
+                self.command_timeout_seconds
+            ));
+        }
+        errors
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawProxyConfig {
     central_system_url: Option<String>,
@@ -378,6 +635,8 @@ impl ProxyConfig {
             errors.push("mqtt client certificates require mqtt.ca_cert_path to be set".to_string());
         }
 
+        errors.extend(self.charging.validate());
+
         errors
     }
 }
@@ -411,6 +670,7 @@ mod tests {
             },
             buffers: BufferConfig::default(),
             state_file: default_state_file(),
+            charging: ChargingConfig::default(),
         }
     }
 
@@ -582,6 +842,7 @@ mod tests {
             logging: LogConfig::default(),
             buffers: BufferConfig::default(),
             state_file: default_state_file(),
+            charging: ChargingConfig::default(),
         };
         let errors = config.validate();
         // Should report all errors, not just the first
@@ -714,5 +975,142 @@ listen_port: 9000
     #[test]
     fn test_default_health_port() {
         assert_eq!(default_health_port(), 8080);
+    }
+
+    // --- charging ---
+
+    #[test]
+    fn test_charging_is_off_by_default_with_sane_limits() {
+        let c = ChargingConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.max_limit_a, 32.0);
+        assert_eq!(c.min_limit_a, 6.0);
+        assert_eq!(c.connector_id, 0);
+        assert_eq!(c.purpose, ChargingProfilePurpose::TxDefaultProfile);
+        assert_eq!(c.profile_kind, ChargingProfileKind::Absolute);
+        assert_eq!(c.rate_unit, ChargingRateUnit::A);
+        assert_eq!(c.number_phases, Some(1));
+        assert_eq!(c.command_timeout(), std::time::Duration::from_secs(30));
+        assert!(c.reapply_on_connect);
+        assert!(c
+            .allowed_configuration_keys
+            .iter()
+            .any(|k| k == "MeterValueSampleInterval"));
+        assert!(
+            !c.allowed_configuration_keys
+                .iter()
+                .any(|k| k.contains("Authorize")),
+            "nothing touching authorisation may be changeable by default"
+        );
+        assert!(c.validate().is_empty());
+    }
+
+    #[test]
+    fn test_charging_validation_rejects_nonsense() {
+        let bad = ChargingConfig {
+            max_limit_a: 0.0,
+            min_limit_a: -1.0,
+            profile_id: 0,
+            number_phases: Some(4),
+            nominal_voltage_v: 12.0,
+            command_timeout_seconds: 0,
+            ..ChargingConfig::default()
+        };
+        let errors = bad.validate();
+        for needle in [
+            "charging.max_limit_a",
+            "charging.min_limit_a",
+            "charging.profile_id",
+            "charging.number_phases",
+            "charging.nominal_voltage_v",
+            "charging.command_timeout_seconds",
+        ] {
+            assert!(
+                errors.iter().any(|e| e.contains(needle)),
+                "expected an error about {needle}, got {errors:?}"
+            );
+        }
+
+        let inverted = ChargingConfig {
+            min_limit_a: 20.0,
+            max_limit_a: 16.0,
+            ..ChargingConfig::default()
+        };
+        assert!(inverted
+            .validate()
+            .iter()
+            .any(|e| e.contains("must not exceed")));
+
+        let wrong_connector = ChargingConfig {
+            purpose: ChargingProfilePurpose::ChargePointMaxProfile,
+            connector_id: 1,
+            ..ChargingConfig::default()
+        };
+        assert!(wrong_connector
+            .validate()
+            .iter()
+            .any(|e| e.contains("must be 0 for ChargePointMaxProfile")));
+    }
+
+    #[test]
+    fn test_charging_errors_surface_through_the_top_level_validate() {
+        let (ca, cert, key) = create_temp_cert_files();
+        let mut config = valid_config(
+            ca.path().to_str().unwrap(),
+            cert.path().to_str().unwrap(),
+            key.path().to_str().unwrap(),
+        );
+        config.charging.max_limit_a = 500.0;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("charging.max_limit_a")));
+    }
+
+    #[test]
+    fn test_charging_section_loads_from_yaml_and_is_absent_by_default() {
+        const BASE: &str = concat!(
+            "central_system_url: \"ws://cs.example/ocpp\"\n",
+            "listen_port: 9000\n",
+            "mqtt:\n",
+            "  host: mqtt.example\n",
+            "  port: 1883\n",
+            "  username: u\n",
+            "  password: p\n",
+        );
+        const CHARGING: &str = concat!(
+            "charging:\n",
+            "  enabled: true\n",
+            "  max_limit_a: 20\n",
+            "  purpose: ChargePointMaxProfile\n",
+            "  profile_kind: Relative\n",
+            "  rate_unit: W\n",
+            "  number_phases: null\n",
+            "  allowed_configuration_keys: [MeterValueSampleInterval]\n",
+        );
+
+        let mut without = NamedTempFile::new().unwrap();
+        without.write_all(BASE.as_bytes()).unwrap();
+        let cfg = ProxyConfig::load_from_path(without.path().to_str().unwrap()).unwrap();
+        assert_eq!(cfg.charging, ChargingConfig::default());
+
+        let mut with = NamedTempFile::new().unwrap();
+        with.write_all(BASE.as_bytes()).unwrap();
+        with.write_all(CHARGING.as_bytes()).unwrap();
+        let cfg = ProxyConfig::load_from_path(with.path().to_str().unwrap()).unwrap();
+        assert!(cfg.charging.enabled);
+        assert_eq!(cfg.charging.max_limit_a, 20.0);
+        assert_eq!(
+            cfg.charging.purpose,
+            ChargingProfilePurpose::ChargePointMaxProfile
+        );
+        assert_eq!(cfg.charging.profile_kind, ChargingProfileKind::Relative);
+        assert_eq!(cfg.charging.rate_unit, ChargingRateUnit::W);
+        assert_eq!(cfg.charging.number_phases, None);
+        assert_eq!(
+            cfg.charging.allowed_configuration_keys,
+            vec!["MeterValueSampleInterval".to_string()]
+        );
+        // Untouched keys keep their defaults.
+        assert_eq!(cfg.charging.min_limit_a, 6.0);
+        assert!(cfg.charging.reapply_on_connect);
     }
 }

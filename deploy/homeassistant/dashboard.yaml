@@ -147,6 +147,56 @@ views:
             name: Previous session ended by
 
       # ---------------------------------------------------------------
+      # Charging-current limit
+      # ---------------------------------------------------------------
+      # The slider publishes to the proxy, which installs a SetChargingProfile
+      # on the charger. The slider then shows what the charger ACCEPTED, from
+      # the retained snapshot — so it is normal for it to sit a second behind
+      # the hand that moved it, and to land on the proxy's ceiling when asked
+      # for more.
+      - type: conditional
+        conditions:
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_limit_status
+            state_not: "accepted"
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_limit_status
+            state_not: "none"
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_limit_status
+            state_not: "unknown"
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_limit_status
+            state_not: "unavailable"
+        card:
+          type: markdown
+          content: >
+            ## ⚠️ Last current limit was **{{ states('sensor.@CHARGE_POINT_SLUG@_charger_current_limit_status') }}**
+
+            {{ state_attr('sensor.@CHARGE_POINT_SLUG@_charger_last_command', 'detail') }}
+
+            The charger is still applying the previous limit
+            ({{ states('number.@CHARGE_POINT_SLUG@_charger_current_limit') }} A).
+
+      - type: entities
+        title: Charging limit
+        state_color: true
+        entities:
+          - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
+            name: Current limit (0 = pause)
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_limit_status
+            name: Last limit command
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_offered
+            name: Offered to the car
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
+            name: Actually drawn
+          - entity: button.@CHARGE_POINT_SLUG@_charger_clear_current_limit
+            name: Remove the limit
+          - type: divider
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_last_command
+            name: Last command result
+          - entity: button.@CHARGE_POINT_SLUG@_charger_read_configuration
+            name: Read charger configuration
+          - entity: button.@CHARGE_POINT_SLUG@_charger_read_applied_limit
+            name: Read applied schedule
+
+      # ---------------------------------------------------------------
       # Trends
       # ---------------------------------------------------------------
       - type: history-graph
@@ -155,6 +205,15 @@ views:
         entities:
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_power
             name: Power
+
+      - type: history-graph
+        title: Current — limit vs drawn (last 6 hours)
+        hours_to_show: 6
+        entities:
+          - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
+            name: Limit
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
+            name: Drawn
 
       - type: history-graph
         title: Charger state

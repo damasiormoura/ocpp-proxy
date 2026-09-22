@@ -5,6 +5,7 @@ ocpp-proxy/
 ├── src/
 │   ├── main.rs          # Entry point: orchestrates startup, main loop, shutdown
 │   ├── lib.rs           # Public module exports (for integration test access)
+│   ├── command.rs       # Proxy-originated charger commands: parsing, OCPP frames, queue, router
 │   ├── config.rs        # Layered config: YAML + env vars, validation
 │   ├── downstream.rs    # WebSocket server accepting charger connections (axum)
 │   ├── upstream.rs      # WebSocket client to Central System (tokio-tungstenite)
@@ -29,6 +30,7 @@ ocpp-proxy/
 
 ## Module Responsibilities
 
+- **command**: The one deliberate exception to transparency. Parses commands off `ocpp/{id}/command`, builds the OCPP Calls (SetChargingProfile, ClearChargingProfile, GetConfiguration, ChangeConfiguration, TriggerMessage, GetCompositeSchedule), applies the limit policy (floor pauses, ceiling clamps), holds the per-session `LocalCallQueue` (one in flight, limit commands coalesce, timeouts) and the `CommandRouter` the MQTT thread uses to reach a session. The session intercepts replies by the `proxy-` id prefix so they never go upstream; the publisher puts results on `ocpp/{id}/command/result` and folds the standing limit into the retained snapshot.
 - **downstream**: Accepts charger WebSocket connections, validates `ocpp1.6` subprotocol, handles connection replacement for same Charge Point ID, routes received messages to forwarder channel.
 - **upstream**: Manages WebSocket client to Central System with 10s connect timeout, exponential backoff reconnection (2s–60s), 5-minute reconnection window.
 - **forwarder**: Priority forwarding path. Sends raw bytes to sink, tracks Call→Response correlation, buffers when destination unavailable, emits MQTT events after forwarding.

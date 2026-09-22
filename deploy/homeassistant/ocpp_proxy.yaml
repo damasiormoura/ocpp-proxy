@@ -279,6 +279,60 @@ mqtt:
       value_template: "{{ value_json.downstream | default('unknown', true) }}"
       device: *charger_device
 
+    # =======================================================================
+    # Charging-current control — the proxy's own OCPP commands
+    # =======================================================================
+    # Only useful when the proxy runs with `charging.enabled: true`; otherwise
+    # every command is answered `rejected` (or nothing subscribes at all) and
+    # these read `none`/`unknown`, which is truthful.
+
+    # Outcome of the most recent limit command, from the retained snapshot:
+    # accepted / rejected / error / timeout. The standing limit itself is the
+    # `number` entity below; this is what tells you a new limit did NOT take,
+    # instead of the slider quietly keeping the old figure.
+    - name: "Charger Current Limit Status"
+      unique_id: ocpp_charger_current_limit_status
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
+      icon: mdi:shield-check-outline
+      value_template: "{{ value_json.current_limit_status | default('none', true) }}"
+      json_attributes_topic: "ocpp/@CHARGE_POINT_ID@/state"
+      json_attributes_template: >-
+        {{ {'current_limit_a': value_json.current_limit_a | default(none),
+            'current_limit_updated': value_json.current_limit_updated | default(none)} | tojson }}
+      availability: *proxy_availability
+      device: *charger_device
+
+    # Every command — limit or not — ends in exactly one message on the result
+    # topic. State is the status; the whole result rides along as attributes,
+    # so `get_configuration` output lands here too.
+    - name: "Charger Last Command"
+      unique_id: ocpp_charger_last_command
+      state_topic: "ocpp/@CHARGE_POINT_ID@/command/result"
+      icon: mdi:console-line
+      value_template: "{{ value_json.status | default('unknown', true) }}"
+      json_attributes_topic: "ocpp/@CHARGE_POINT_ID@/command/result"
+      availability: *proxy_availability
+      device: *charger_device
+
+    # What the charger is offering the car, if it reports Current.Offered in
+    # MeterValues (not every firmware does; add it to MeterValuesSampledData
+    # with change_configuration if not). The direct evidence that a limit took.
+    - name: "Charger Current Offered"
+      unique_id: ocpp_charger_current_offered
+      state_topic: "ocpp/@CHARGE_POINT_ID@/charger/MeterValues"
+      device_class: current
+      state_class: measurement
+      unit_of_measurement: "A"
+      value_template: >-
+        {% set sv = value_json.payload[3].meterValue | default([], true) | last %}
+        {% set vals = (sv.sampledValue | default([], true))
+             | selectattr('measurand', 'defined')
+             | selectattr('measurand', 'eq', 'Current.Offered')
+             | map(attribute='value') | list %}
+        {{ (vals[0] | float(0)) | round(1) if vals else this.state }}
+      availability: *proxy_availability
+      device: *charger_device
+
   binary_sensor:
     # Driven by the proxy's MQTT Last Will. This is the ONLY thing that tells
     # you the proxy has died — nothing else watches that process, and with the
@@ -290,6 +344,74 @@ mqtt:
       payload_on: "online"
       payload_off: "offline"
       device_class: connectivity
+      device: *charger_device
+
+  # =========================================================================
+  # Charging-current limit — the control
+  # =========================================================================
+  # Publishes the slider value as a bare number to the proxy's convenience
+  # topic; the proxy turns it into a SetChargingProfile on the charger and the
+  # accepted value comes back through the retained snapshot, which is what the
+  # slider displays. Not optimistic: the slider shows what the charger took,
+  # not what was asked. A request over the proxy's ceiling is clamped there
+  # and the status sensor's `detail` says so.
+  #
+  # 0 pauses charging (the transaction stays open); 1–5 A are sent as 0 too,
+  # because an EV will not charge under 6 A. `max` here is the slider's range
+  # only — the ceiling that is actually enforced is `charging.max_limit_a` in
+  # the proxy's config.
+  number:
+    - name: "Charger Current Limit"
+      unique_id: ocpp_charger_current_limit
+      command_topic: "ocpp/@CHARGE_POINT_ID@/command/current_limit"
+      state_topic: "ocpp/@CHARGE_POINT_ID@/state"
+      # `default(none)` without the boolean: only a missing key becomes None,
+      # a legitimate 0 A stays 0. Rendering "None" resets the entity to
+      # unknown (payload_reset), which is the truth when no limit is set.
+      value_template: >-
+        {% set v = value_json.current_limit_a | default(none) %}
+        {{ v if v is not none else 'None' }}
+      payload_reset: "None"
+      min: 0
+      max: 32
+      step: 1
+      mode: slider
+      unit_of_measurement: "A"
+      device_class: current
+      icon: mdi:current-ac
+      qos: 1
+      retain: false
+      optimistic: false
+      availability: *proxy_availability
+      device: *charger_device
+
+  button:
+    - name: "Charger Clear Current Limit"
+      unique_id: ocpp_charger_clear_current_limit
+      command_topic: "ocpp/@CHARGE_POINT_ID@/command"
+      payload_press: '{"command": "clear_current_limit", "id": "ha-clear-limit"}'
+      icon: mdi:lock-open-variant-outline
+      qos: 1
+      availability: *proxy_availability
+      device: *charger_device
+
+    # The answer lands in sensor.<slug>_charger_last_command's attributes.
+    - name: "Charger Read Configuration"
+      unique_id: ocpp_charger_read_configuration
+      command_topic: "ocpp/@CHARGE_POINT_ID@/command"
+      payload_press: '{"command": "get_configuration", "id": "ha-get-configuration"}'
+      icon: mdi:file-document-outline
+      qos: 1
+      availability: *proxy_availability
+      device: *charger_device
+
+    - name: "Charger Read Applied Limit"
+      unique_id: ocpp_charger_read_applied_limit
+      command_topic: "ocpp/@CHARGE_POINT_ID@/command"
+      payload_press: '{"command": "get_composite_schedule", "duration_s": 3600, "id": "ha-composite-schedule"}'
+      icon: mdi:chart-timeline-variant
+      qos: 1
+      availability: *proxy_availability
       device: *charger_device
 
 # =========================================================================

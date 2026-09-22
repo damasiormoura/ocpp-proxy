@@ -26,13 +26,15 @@
 //! staging queue in front of the request channel, and FIFO order holds across
 //! both roles.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rumqttc::TlsConfiguration;
-use rumqttc::{AsyncClient, Event, EventLoop, Incoming, LastWill, MqttOptions, QoS, Transport};
+use rumqttc::{
+    AsyncClient, Event, EventLoop, Incoming, LastWill, MqttOptions, QoS, SubscribeFilter, Transport,
+};
 
 use crate::snapshot_store::SnapshotStore;
 use serde::Serialize;
@@ -40,7 +42,11 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use crate::config::MqttConfig;
+use crate::command::{
+    self, CommandRequest, CommandResult, CommandRouter, CommandSource, CommandStatus,
+    DispatchError, ProxyCommand, COMMAND_SUBSCRIPTIONS,
+};
+use crate::config::{ChargingConfig, MqttConfig};
 use crate::error::ProxyError;
 use crate::forwarder::MqttEvent;
 use crate::models::{
@@ -135,6 +141,18 @@ pub struct ChargePointState {
     /// message in. They differ if the charger buffered the message offline.
     pub last_stop_time: Option<String>,
 
+    /// The charging-current limit the proxy last had the charger accept, in
+    /// amps. `None` when no proxy limit is installed. `0` means paused.
+    #[serde(default)]
+    pub current_limit_a: Option<f64>,
+    /// Outcome of the most recent limit command: `accepted`, `rejected`,
+    /// `error` or `timeout`. Lets the dashboard show a limit that did not
+    /// take, rather than silently keeping the previous figure.
+    #[serde(default)]
+    pub current_limit_status: Option<String>,
+    #[serde(default)]
+    pub current_limit_updated: Option<String>,
+
     /// ISO 8601 time this snapshot last changed.
     pub last_updated: Option<String>,
 }
@@ -206,6 +224,33 @@ impl ChargePointState {
             return false;
         }
         self.last_updated = Some(chrono::Utc::now().to_rfc3339());
+        true
+    }
+}
+
+impl ChargePointState {
+    /// Fold the outcome of a limit command into the snapshot. Other commands
+    /// leave it untouched. Returns whether anything changed.
+    pub fn apply_command_result(&mut self, result: &CommandResult) -> bool {
+        if !result.is_limit_result() {
+            return false;
+        }
+        let before = self.clone();
+
+        self.current_limit_status = Some(result.status.as_str().to_string());
+        if result.status == CommandStatus::Accepted {
+            self.current_limit_a = match result.action.as_deref() {
+                Some("SetChargingProfile") => result.applied_limit_a,
+                _ => None,
+            };
+        }
+
+        if *self == before {
+            return false;
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        self.current_limit_updated = Some(now.clone());
+        self.last_updated = Some(now);
         true
     }
 }
@@ -310,6 +355,14 @@ pub struct MqttPublisher {
     /// say `Flushed buffered MQTT messages` exactly once, when the backlog
     /// the reconnect found has actually gone.
     flush_in_progress: Option<usize>,
+    /// Set when charger commands are enabled: where incoming commands go.
+    command_router: Option<CommandRouter>,
+    charging: Option<ChargingConfig>,
+    /// The command subscriptions still have to be (re)sent on this connection.
+    subscribe_pending: bool,
+    /// Last known (upstream, downstream) per charge point, to spot the link
+    /// coming up and re-apply the standing limit.
+    link_state: HashMap<String, (ConnectionState, ConnectionState)>,
 }
 
 impl MqttPublisher {
@@ -391,7 +444,23 @@ impl MqttPublisher {
             snapshot_store,
             state_manager: None,
             flush_in_progress: None,
+            command_router: None,
+            charging: None,
+            subscribe_pending: false,
+            link_state: HashMap::new(),
         })
+    }
+
+    /// Accept charger commands from MQTT and route them to sessions. Without
+    /// this the publisher never subscribes to anything.
+    pub fn with_command_router(mut self, router: CommandRouter, charging: ChargingConfig) -> Self {
+        self.command_router = Some(router);
+        self.charging = Some(charging);
+        self
+    }
+
+    pub fn commands_enabled(&self) -> bool {
+        self.command_router.is_some()
     }
 
     /// Mirror every MQTT connection state change into the shared manager, so
@@ -538,6 +607,199 @@ impl MqttPublisher {
         self.publish_online();
         self.flush_buffer();
         self.republish_snapshots();
+        // Sessions are clean, so subscriptions do not survive a reconnect.
+        self.subscribe_pending = self.command_router.is_some();
+        self.try_subscribe();
+    }
+
+    /// Send the command subscriptions if they are due. Same rule as publishes:
+    /// never await the request channel from the task that drives `poll()`;
+    /// if it is full now, the next event-loop tick retries.
+    fn try_subscribe(&mut self) {
+        if !self.subscribe_pending {
+            return;
+        }
+        let filters = COMMAND_SUBSCRIPTIONS
+            .iter()
+            .map(|f| SubscribeFilter::new(f.to_string(), QoS::AtLeastOnce));
+        match self.client.try_subscribe_many(filters) {
+            Ok(()) => {
+                self.subscribe_pending = false;
+                info!(
+                    component = "mqtt",
+                    charge_point_id = self.lwt_id(),
+                    topics = ?COMMAND_SUBSCRIPTIONS,
+                    "Subscribed to charger command topics"
+                );
+            }
+            Err(_) => {
+                debug!(
+                    component = "mqtt",
+                    charge_point_id = self.lwt_id(),
+                    "MQTT request channel full; command subscription retries on the next tick"
+                );
+            }
+        }
+    }
+
+    /// A message arrived on a subscribed topic: a command for a charger.
+    fn handle_incoming_publish(&mut self, topic: &str, payload: &[u8]) {
+        let Some((charge_point_id, kind)) = command::parse_command_topic(topic) else {
+            debug!(
+                component = "mqtt",
+                topic = %topic,
+                "Ignoring incoming message on a topic that is not a command"
+            );
+            return;
+        };
+
+        let request = match command::parse_command_payload(kind, payload) {
+            Ok(request) => request,
+            Err(reason) => {
+                warn!(
+                    component = "mqtt",
+                    charge_point_id = %charge_point_id,
+                    topic = %topic,
+                    reason = %reason,
+                    "Rejecting malformed charger command"
+                );
+                self.publish_command_result(
+                    &charge_point_id,
+                    CommandResult::invalid_payload(reason),
+                );
+                return;
+            }
+        };
+
+        self.dispatch_command(&charge_point_id, request);
+    }
+
+    /// Hand a request to the charger's session, or answer for it when there
+    /// is none to hand it to.
+    fn dispatch_command(&mut self, charge_point_id: &str, request: CommandRequest) {
+        let Some(router) = &self.command_router else {
+            self.publish_command_result(
+                charge_point_id,
+                CommandResult::for_request(
+                    &request,
+                    CommandStatus::Rejected,
+                    Some("charger commands are disabled on this proxy".to_string()),
+                ),
+            );
+            return;
+        };
+
+        match router.dispatch(charge_point_id, request.clone()) {
+            Ok(()) => {
+                debug!(
+                    component = "mqtt",
+                    charge_point_id = %charge_point_id,
+                    command_id = %request.id,
+                    action = request.command.action(),
+                    "Charger command handed to its session"
+                );
+            }
+            Err(DispatchError::NotConnected) => {
+                warn!(
+                    component = "mqtt",
+                    charge_point_id = %charge_point_id,
+                    command_id = %request.id,
+                    "Charger command for a charger that is not connected"
+                );
+                self.publish_command_result(
+                    charge_point_id,
+                    CommandResult::for_request(
+                        &request,
+                        CommandStatus::NotConnected,
+                        Some("no charger with this id is connected to the proxy".to_string()),
+                    ),
+                );
+            }
+            Err(DispatchError::QueueFull) => {
+                warn!(
+                    component = "mqtt",
+                    charge_point_id = %charge_point_id,
+                    command_id = %request.id,
+                    "Charger command dropped: the session's command queue is full"
+                );
+                self.publish_command_result(
+                    charge_point_id,
+                    CommandResult::for_request(
+                        &request,
+                        CommandStatus::Rejected,
+                        Some("the session's command queue is full".to_string()),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Publish a command's outcome and, for limit commands, fold it into the
+    /// retained snapshot so the dashboard shows the standing limit.
+    fn publish_command_result(&mut self, charge_point_id: &str, result: CommandResult) {
+        match serde_json::to_vec(&result) {
+            Ok(payload) => self.enqueue(MqttMessage {
+                topic: command::command_result_topic(charge_point_id),
+                payload,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+            }),
+            Err(e) => warn!(
+                component = "mqtt",
+                charge_point_id = %charge_point_id,
+                error = %e,
+                "Failed to serialize command result"
+            ),
+        }
+
+        let snapshot = {
+            let entry = self
+                .charge_point_state
+                .entry(charge_point_id.to_string())
+                .or_default();
+            if entry.apply_command_result(&result) {
+                Some(entry.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            self.snapshot_store.save(&self.charge_point_state);
+            self.publish_charge_point_state(charge_point_id, &snapshot);
+        }
+    }
+
+    /// The charger and the Central System are both connected again. If a
+    /// limit was standing, re-send it: a charger that rebooted may have
+    /// forgotten its profiles, and silence would mean full current.
+    fn maybe_reapply_limit(&mut self, charge_point_id: &str) {
+        let Some(charging) = &self.charging else {
+            return;
+        };
+        if !charging.reapply_on_connect {
+            return;
+        }
+        let standing = self
+            .charge_point_state
+            .get(charge_point_id)
+            .filter(|st| st.current_limit_status.as_deref() == Some("accepted"))
+            .and_then(|st| st.current_limit_a);
+        let Some(limit_a) = standing else {
+            return;
+        };
+
+        info!(
+            component = "mqtt",
+            charge_point_id = %charge_point_id,
+            limit_a = limit_a,
+            "Link is up; re-applying the standing current limit"
+        );
+        let request = CommandRequest::new(
+            format!("reapply-{}", chrono::Utc::now().timestamp_millis()),
+            ProxyCommand::SetCurrentLimit { limit_a },
+            CommandSource::Reapply,
+        );
+        self.dispatch_command(charge_point_id, request);
     }
 
     /// Queue a retained "online" message to the availability topic.
@@ -600,11 +862,18 @@ impl MqttPublisher {
                             );
                             self.on_connack().await;
                         }
+                        Ok(Event::Incoming(Incoming::Publish(publish))) => {
+                            self.handle_incoming_publish(&publish.topic, &publish.payload);
+                            if self.state == ConnectionState::Connected {
+                                self.drain_buffer();
+                            }
+                        }
                         Ok(_) => {
                             // Every other event (Outgoing::Publish, PubAck,
                             // PingResp, ...) means `poll()` just ran, so the
                             // request channel may have room again.
                             if self.state == ConnectionState::Connected {
+                                self.try_subscribe();
                                 self.drain_buffer();
                             }
                         }
@@ -755,6 +1024,25 @@ impl MqttPublisher {
                     qos: QoS::AtLeastOnce,
                     retain: true,
                 });
+
+                let both_up = upstream == ConnectionState::Connected
+                    && downstream == ConnectionState::Connected;
+                let previous = self
+                    .link_state
+                    .insert(charge_point_id.clone(), (upstream, downstream));
+                let was_up = matches!(
+                    previous,
+                    Some((ConnectionState::Connected, ConnectionState::Connected))
+                );
+                if both_up && !was_up {
+                    self.maybe_reapply_limit(&charge_point_id);
+                }
+            }
+            MqttEvent::CommandResult {
+                charge_point_id,
+                result,
+            } => {
+                self.publish_command_result(&charge_point_id, result);
             }
         }
     }
@@ -1235,6 +1523,9 @@ mod tests {
             "last_transaction_id",
             "last_stop_reason",
             "last_stop_time",
+            "current_limit_a",
+            "current_limit_status",
+            "current_limit_updated",
         ] {
             assert!(
                 v.get(key).is_some(),
@@ -2000,5 +2291,124 @@ mod tests {
             manager.lock().await.mqtt_state(),
             ConnectionState::Reconnecting
         );
+    }
+
+    // --- command results in the snapshot ---
+
+    fn limit_result(action: &str, status: CommandStatus, applied: Option<f64>) -> CommandResult {
+        let request = CommandRequest::new(
+            "r",
+            match action {
+                "SetChargingProfile" => ProxyCommand::SetCurrentLimit {
+                    limit_a: applied.unwrap_or(0.0),
+                },
+                _ => ProxyCommand::ClearCurrentLimit,
+            },
+            CommandSource::Mqtt,
+        );
+        let mut result = CommandResult::for_request(&request, status, None);
+        result.action = Some(action.to_string());
+        result.applied_limit_a = applied;
+        result
+    }
+
+    #[test]
+    fn test_accepted_limit_lands_in_the_snapshot_and_clear_removes_it() {
+        let mut st = ChargePointState::default();
+        assert!(st.apply_command_result(&limit_result(
+            "SetChargingProfile",
+            CommandStatus::Accepted,
+            Some(16.0)
+        )));
+        assert_eq!(st.current_limit_a, Some(16.0));
+        assert_eq!(st.current_limit_status.as_deref(), Some("accepted"));
+        assert!(st.current_limit_updated.is_some());
+        assert!(st.last_updated.is_some());
+
+        assert!(st.apply_command_result(&limit_result(
+            "ClearChargingProfile",
+            CommandStatus::Accepted,
+            None
+        )));
+        assert_eq!(st.current_limit_a, None);
+        assert_eq!(st.current_limit_status.as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn test_rejected_limit_records_the_status_but_keeps_the_standing_value() {
+        let mut st = ChargePointState::default();
+        st.apply_command_result(&limit_result(
+            "SetChargingProfile",
+            CommandStatus::Accepted,
+            Some(16.0),
+        ));
+        assert!(st.apply_command_result(&limit_result(
+            "SetChargingProfile",
+            CommandStatus::Rejected,
+            Some(10.0)
+        )));
+        assert_eq!(
+            st.current_limit_a,
+            Some(16.0),
+            "the charger still applies the last limit it accepted"
+        );
+        assert_eq!(st.current_limit_status.as_deref(), Some("rejected"));
+    }
+
+    #[test]
+    fn test_repeated_identical_limit_result_reports_no_change() {
+        let mut st = ChargePointState::default();
+        let r = limit_result("SetChargingProfile", CommandStatus::Accepted, Some(16.0));
+        assert!(st.apply_command_result(&r));
+        assert!(!st.apply_command_result(&r));
+    }
+
+    #[test]
+    fn test_non_limit_results_leave_the_snapshot_alone() {
+        let mut st = ChargePointState::default();
+        let request = CommandRequest::new(
+            "r",
+            ProxyCommand::GetConfiguration { keys: vec![] },
+            CommandSource::Mqtt,
+        );
+        let result = CommandResult::for_request(&request, CommandStatus::Accepted, None);
+        assert!(!st.apply_command_result(&result));
+        assert_eq!(st, ChargePointState::default());
+    }
+
+    #[test]
+    fn test_snapshot_without_limit_keys_still_loads() {
+        // A state.json written before this change has none of the new keys.
+        let legacy = r#"{"connector_status":"Available","error_code":"NoError",
+            "transaction_id":null,"id_tag":null,"meter_start_wh":null,
+            "last_meter_stop_wh":8084000,"last_session_energy_wh":7555,
+            "last_transaction_id":1,"last_stop_reason":"Local","last_stop_time":null,
+            "last_updated":"2026-09-01T07:22:16+00:00"}"#;
+        let st: ChargePointState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(st.current_limit_a, None);
+        assert_eq!(st.current_limit_status, None);
+        assert_eq!(st.last_meter_stop_wh, Some(8084000));
+    }
+
+    #[test]
+    fn test_publisher_only_subscribes_when_given_a_router() {
+        let (_, event_tx) = publisher_with_events(Some("CP-1"));
+        drop(event_tx);
+        let (rx_tx, rx) = mpsc::channel(1);
+        drop(rx_tx);
+        let plain = MqttPublisher::new(
+            &plaintext_config(),
+            Some("CP-1".to_string()),
+            rx,
+            10,
+            SnapshotStore::disabled(),
+        )
+        .unwrap();
+        assert!(!plain.commands_enabled());
+        let with = plain.with_command_router(
+            crate::command::CommandRouter::new(),
+            crate::config::ChargingConfig::default(),
+        );
+        assert!(with.commands_enabled());
     }
 }

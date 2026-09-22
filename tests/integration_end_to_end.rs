@@ -21,6 +21,8 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tokio_util::sync::CancellationToken;
 
+use ocpp_proxy::command::CommandRouter;
+use ocpp_proxy::config::ChargingConfig;
 use ocpp_proxy::downstream::{create_router, DownstreamState, OCPP16_SUBPROTOCOL};
 use ocpp_proxy::forwarder::MqttEvent;
 use ocpp_proxy::models::Direction;
@@ -133,6 +135,7 @@ impl ProxyUnderTest {
             max_backoff: Duration::from_millis(200),
             max_reconnect_window: Duration::from_secs(2),
             call_tracker_max_age: Duration::from_secs(300),
+            charging: ChargingConfig::default(),
         });
 
         let downstream_state = DownstreamState {
@@ -142,6 +145,7 @@ impl ProxyUnderTest {
             mqtt_tx,
             shutdown: shutdown.clone(),
             generation: Arc::new(AtomicU64::new(1)),
+            command_router: CommandRouter::new(),
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -553,6 +557,7 @@ async fn all_mqtt_senders_are_released_on_shutdown() {
         max_backoff: Duration::from_millis(200),
         max_reconnect_window: Duration::from_secs(2),
         call_tracker_max_age: Duration::from_secs(300),
+        charging: ChargingConfig::default(),
     });
 
     let downstream_state = DownstreamState {
@@ -562,6 +567,7 @@ async fn all_mqtt_senders_are_released_on_shutdown() {
         mqtt_tx,
         shutdown: shutdown.clone(),
         generation: Arc::new(AtomicU64::new(1)),
+        command_router: CommandRouter::new(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

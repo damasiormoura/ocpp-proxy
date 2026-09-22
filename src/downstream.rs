@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::command::{CommandRequest, CommandRouter, COMMAND_CHANNEL_CAPACITY};
 use crate::forwarder::MqttEvent;
 use crate::models::{ConnectionId, ConnectionState};
 use crate::session::{self, SessionConfig};
@@ -59,6 +60,9 @@ pub struct DownstreamState {
     pub shutdown: CancellationToken,
     /// Source of connection generations.
     pub generation: Arc<AtomicU64>,
+    /// Where the MQTT publisher finds this charger's session to hand it a
+    /// proxy command. Registered per connection generation.
+    pub command_router: CommandRouter,
 }
 
 /// Validates the `Sec-WebSocket-Protocol` header for the OCPP 1.6 subprotocol.
@@ -206,6 +210,14 @@ async fn handle_connection(socket: WebSocket, charge_point_id: String, state: Do
     let cancel = state.shutdown.child_token();
     let generation = register_connection(&state, &charge_point_id, cancel.clone()).await;
 
+    // Registered before the session starts, so a command (or a limit re-apply
+    // triggered by the link coming up) has somewhere to land from the first
+    // moment; it waits in the channel until the forwarding loop is running.
+    let (command_tx, command_rx) = mpsc::channel::<CommandRequest>(COMMAND_CHANNEL_CAPACITY);
+    state
+        .command_router
+        .register(&charge_point_id, generation, command_tx);
+
     let (upstream, downstream) = {
         let mut mgr = state.state_manager.lock().await;
         mgr.transition(ConnectionId::Downstream, ConnectionState::Connected);
@@ -227,8 +239,13 @@ async fn handle_connection(socket: WebSocket, charge_point_id: String, state: Do
         state.state_manager.clone(),
         state.mqtt_tx.clone(),
         cancel,
+        command_rx,
     )
     .await;
+
+    state
+        .command_router
+        .deregister(&charge_point_id, generation);
 
     // ---- deregister, but only if we are still the current connection ----
     let still_current = deregister_connection(&state, &charge_point_id, generation).await;
@@ -371,6 +388,7 @@ mod tests {
             max_backoff: Duration::from_millis(50),
             max_reconnect_window: Duration::from_millis(100),
             call_tracker_max_age: Duration::from_secs(300),
+            charging: crate::config::ChargingConfig::default(),
         }
     }
 
@@ -385,6 +403,7 @@ mod tests {
             mqtt_tx: msg_tx,
             shutdown: CancellationToken::new(),
             generation: Arc::new(AtomicU64::new(1)),
+            command_router: CommandRouter::new(),
         }
     }
 

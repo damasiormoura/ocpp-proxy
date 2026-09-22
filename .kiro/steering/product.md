@@ -9,11 +9,13 @@ OCPP Proxy is a WebSocket proxy for OCPP 1.6J (Open Charge Point Protocol) that 
 - Forward OCPP messages byte-for-byte between charger and central system (priority path)
 - Publish OCPP events asynchronously to MQTT for Home Assistant consumption
 - Expose a health check endpoint for Home Assistant monitoring and manual diagnosis
+- On request from Home Assistant (opt-in, `charging.enabled`), send SetChargingProfile and a few companion Calls to the charger, and report the outcome over MQTT
 - Handle graceful shutdown with in-flight message completion
 
 ## Key Invariants
 
 - Messages are forwarded byte-for-byte — no modification, no re-serialization
+- The proxy originates OCPP only when charger control is enabled, only towards the charger, one Call in flight at a time and never while a Central System Call is outstanding; replies to proxy Calls (ids prefixed `proxy-`) are consumed, never forwarded
 - FIFO ordering is maintained per direction
 - MQTT publishing never blocks the forwarding path
 - Buffers use FIFO eviction when full (oldest messages discarded first)

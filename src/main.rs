@@ -23,6 +23,7 @@ use tokio::time::Instant;
 use tracing::{error, info, warn};
 use url::Url;
 
+use ocpp_proxy::command::CommandRouter;
 use ocpp_proxy::config::ProxyConfig;
 use ocpp_proxy::downstream::{self, DownstreamState};
 use ocpp_proxy::forwarder::MqttEvent;
@@ -95,7 +96,25 @@ async fn main() {
     );
 
     // ---- shared state: ONE manager, used by health, downstream and sessions ----
+    if config.charging.enabled {
+        info!(
+            component = "main",
+            max_limit_a = config.charging.max_limit_a,
+            min_limit_a = config.charging.min_limit_a,
+            purpose = config.charging.purpose.as_str(),
+            connector_id = config.charging.connector_id,
+            reapply_on_connect = config.charging.reapply_on_connect,
+            "Charger commands enabled: the proxy will act on ocpp/<id>/command topics"
+        );
+    } else {
+        info!(
+            component = "main",
+            "Charger commands disabled (charging.enabled = false); the proxy is fully transparent"
+        );
+    }
+
     let state_manager = Arc::new(Mutex::new(ConnectionStateManager::new(64)));
+    let command_router = CommandRouter::new();
 
     let (mqtt_tx, mqtt_rx) = mpsc::channel::<MqttEvent>(1000);
 
@@ -127,6 +146,8 @@ async fn main() {
     debug_assert!(snapshot_store.is_enabled() || config.state_file.trim().is_empty());
     let state_for_mqtt = state_manager.clone();
     let mqtt_shutdown = shutdown_token.clone();
+    let router_for_mqtt = command_router.clone();
+    let charging_for_mqtt = config.charging.clone();
 
     let mqtt_handle = std::thread::Builder::new()
         .name("mqtt".to_string())
@@ -154,7 +175,14 @@ async fn main() {
                     // from here on: every ConnAck and every lost connection
                     // is mirrored there, so `/health` tracks the event loop
                     // rather than the startup result.
-                    Ok(p) => p.with_state_manager(state_for_mqtt.clone()),
+                    Ok(p) => {
+                        let p = p.with_state_manager(state_for_mqtt.clone());
+                        if charging_for_mqtt.enabled {
+                            p.with_command_router(router_for_mqtt, charging_for_mqtt)
+                        } else {
+                            p
+                        }
+                    }
                     Err(e) => {
                         error!(component = "mqtt", error = %e, "MQTT publisher unavailable; \
                                proxying continues without Home Assistant visibility");
@@ -253,6 +281,7 @@ async fn main() {
         max_backoff: Duration::from_secs(config.buffers.max_backoff_seconds),
         max_reconnect_window: UPSTREAM_RECONNECT_WINDOW,
         call_tracker_max_age: CALL_TRACKER_MAX_AGE,
+        charging: config.charging.clone(),
     });
 
     let downstream_state = DownstreamState {
@@ -262,6 +291,7 @@ async fn main() {
         mqtt_tx: mqtt_tx.clone(),
         shutdown: shutdown_token.clone(),
         generation: Arc::new(AtomicU64::new(1)),
+        command_router,
     };
 
     let listen_addr = SocketAddr::new(config.listen_address, config.listen_port);

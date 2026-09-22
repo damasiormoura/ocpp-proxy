@@ -38,6 +38,13 @@ pub enum MqttEvent {
         /// Current downstream connection state.
         downstream: ConnectionState,
     },
+    /// A proxy-originated command (see `crate::command`) reached an outcome.
+    CommandResult {
+        /// The charger the command was addressed to.
+        charge_point_id: String,
+        /// What happened, ready to publish.
+        result: crate::command::CommandResult,
+    },
 }
 
 /// A pending Call message awaiting its CallResult or CallError response.
@@ -125,6 +132,20 @@ impl CallTracker {
     /// Returns the number of currently tracked pending calls.
     pub fn pending_count(&self) -> usize {
         self.pending_calls.len()
+    }
+
+    /// Whether a Call in `direction` is still awaiting its response and is
+    /// younger than `max_age`. Used to hold proxy-originated Calls while the
+    /// Central System has a question outstanding with the charger — OCPP 1.6
+    /// allows a Charge Point one pending request at a time. Older entries
+    /// are treated as lost rather than as a reason to keep waiting.
+    pub fn has_recent_pending_in(&self, direction: Direction, max_age: Duration) -> bool {
+        let now = Utc::now();
+        let max_age =
+            chrono::Duration::from_std(max_age).unwrap_or_else(|_| chrono::Duration::seconds(10));
+        self.pending_calls
+            .values()
+            .any(|pending| pending.direction == direction && now - pending.sent_at < max_age)
     }
 }
 
@@ -236,6 +257,11 @@ impl MessageForwarder {
     /// The Charge Point ID this forwarder serves.
     pub fn charge_point_id(&self) -> &str {
         &self.charge_point_id
+    }
+
+    /// See [`CallTracker::has_recent_pending_in`].
+    pub fn has_recent_pending_call(&self, direction: Direction, max_age: Duration) -> bool {
+        self.call_tracker.has_recent_pending_in(direction, max_age)
     }
 
     /// Forward a message from the charger to the central system (upstream).
@@ -551,6 +577,42 @@ mod tests {
     fn test_call_tracker_resolve_unknown_returns_none() {
         let mut tracker = CallTracker::new(Duration::from_secs(300));
         assert_eq!(tracker.resolve("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_call_tracker_recent_pending_is_per_direction_and_ages_out() {
+        let mut tracker = CallTracker::new(Duration::from_secs(300));
+        assert!(
+            !tracker.has_recent_pending_in(Direction::CentralToCharger, Duration::from_secs(10))
+        );
+
+        tracker.track_call(
+            "cs-1",
+            "RemoteStartTransaction",
+            Direction::CentralToCharger,
+        );
+        assert!(tracker.has_recent_pending_in(Direction::CentralToCharger, Duration::from_secs(10)));
+        assert!(
+            !tracker.has_recent_pending_in(Direction::ChargerToCentral, Duration::from_secs(10))
+        );
+
+        tracker.resolve("cs-1");
+        assert!(
+            !tracker.has_recent_pending_in(Direction::CentralToCharger, Duration::from_secs(10))
+        );
+
+        tracker.pending_calls.insert(
+            "stale".to_string(),
+            PendingCall {
+                action: "Reset".to_string(),
+                direction: Direction::CentralToCharger,
+                sent_at: Utc::now() - chrono::Duration::seconds(30),
+            },
+        );
+        assert!(
+            !tracker.has_recent_pending_in(Direction::CentralToCharger, Duration::from_secs(10)),
+            "a Call the charger never answered must not block the proxy forever"
+        );
     }
 
     #[test]
