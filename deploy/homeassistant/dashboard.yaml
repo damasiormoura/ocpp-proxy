@@ -197,6 +197,104 @@ views:
             name: Read applied schedule
 
       # ---------------------------------------------------------------
+      # Load balancing
+      # ---------------------------------------------------------------
+      # These entities come from the site's load-balancing package, not from
+      # this repository: the one that moves the limit above from the mains
+      # meter. The names are the contract — input_boolean.ev_load_balancing,
+      # sensor.ev_available_current, sensor.house_power_excluding_charger,
+      # the four input_number.ev_* knobs and the automation.ev_load_balancing_*
+      # automations. Without that package these rows read "entity not found";
+      # delete the two cards in that case.
+      - type: conditional
+        conditions:
+          - entity: input_boolean.ev_load_balancing
+            state: "off"
+        card:
+          type: markdown
+          content: >
+            **Load balancing is off.** The charger holds whatever limit the
+            slider last set; nothing is watching the mains.
+
+      - type: horizontal-stack
+        cards:
+          # The whole house except the car, against the contract. Adjust `max`
+          # and the severity bands to the contracted power (6.9 kVA here).
+          - type: gauge
+            entity: sensor.house_power_excluding_charger
+            name: House load
+            unit: W
+            min: 0
+            max: 6900
+            needle: true
+            severity:
+              green: 0
+              yellow: 4000
+              red: 5500
+          - type: gauge
+            entity: sensor.ev_available_current
+            name: Available for the car
+            unit: A
+            min: 0
+            max: 32
+            needle: true
+            severity:
+              red: 0
+              yellow: 6
+              green: 10
+
+      - type: entities
+        title: Load balancing
+        state_color: true
+        entities:
+          - entity: input_boolean.ev_load_balancing
+            name: Balancing active
+          - entity: sensor.ev_available_current
+            name: Current available for the car
+          - type: attribute
+            entity: sensor.ev_available_current
+            attribute: headroom_w
+            name: Headroom after the reserve
+            suffix: " W"
+            icon: mdi:arrow-expand-vertical
+          - entity: sensor.house_power_excluding_charger
+            name: House load (EDP clamp)
+          - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
+            name: Limit on the charger now
+          - type: divider
+          - entity: input_number.ev_contracted_power_va
+            name: Contracted power
+          - entity: input_number.ev_load_balancing_reserve_w
+            name: Reserve for loads switching on
+          - entity: input_number.ev_charger_max_current_a
+            name: Working ceiling
+          - entity: input_number.ev_charger_min_current_a
+            name: Pause below
+          - type: divider
+          - entity: automation.ev_load_balancing_reduce
+            name: Reduce
+            secondary_info: last-triggered
+          - entity: automation.ev_load_balancing_restore
+            name: Restore
+            secondary_info: last-triggered
+          - entity: automation.ev_load_balancing_house_reading_lost
+            name: Mains reading lost
+            secondary_info: last-triggered
+
+      - type: history-graph
+        title: Balancing — house, available, limit, drawn (last 6 hours)
+        hours_to_show: 6
+        entities:
+          - entity: sensor.house_power_excluding_charger
+            name: House W
+          - entity: sensor.ev_available_current
+            name: Available A
+          - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
+            name: Limit A
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
+            name: Drawn A
+
+      # ---------------------------------------------------------------
       # Trends
       # ---------------------------------------------------------------
       - type: history-graph
