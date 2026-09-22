@@ -218,12 +218,15 @@ views:
 
       - type: horizontal-stack
         cards:
-          # The whole house except the car, against the contract. Adjust `max`
-          # and the severity bands to the contracted power (6.9 kVA here).
+          # The whole house except the car, against the contract — APPARENT
+          # power, because the contract and the meter's limiter are in kVA, so
+          # this reads higher than the EDP active-power sensor by the power
+          # factor. Adjust `max` and the bands to the contracted power (6.9 kVA
+          # here).
           - type: gauge
             entity: sensor.house_power_excluding_charger
-            name: House load
-            unit: W
+            name: House load (apparent)
+            unit: VA
             min: 0
             max: 6900
             needle: true
@@ -258,7 +261,18 @@ views:
             suffix: " W"
             icon: mdi:arrow-expand-vertical
           - entity: sensor.house_power_excluding_charger
-            name: House load (EDP clamp)
+            name: House load, apparent (EDP clamp)
+          - type: attribute
+            entity: sensor.house_power_excluding_charger
+            attribute: house_active_w
+            name: House load, active
+            suffix: " W"
+            icon: mdi:home-lightning-bolt
+          - type: attribute
+            entity: sensor.house_power_excluding_charger
+            attribute: power_factor
+            name: Power factor
+            icon: mdi:sine-wave
           - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
             name: Limit on the charger now
           - type: divider
@@ -286,7 +300,7 @@ views:
         hours_to_show: 6
         entities:
           - entity: sensor.house_power_excluding_charger
-            name: House W
+            name: House VA
           - entity: sensor.ev_available_current
             name: Available A
           - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
