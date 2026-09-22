@@ -330,7 +330,9 @@ mqtt:
              | selectattr('measurand', 'defined')
              | selectattr('measurand', 'eq', 'Power.Offered')
              | map(attribute='value') | list %}
-        {{ (vals[0] | float(0)) | round(0) | int if vals else this.state }}
+        {%- if vals %}{{ (vals[0] | float(0)) | round(0) | int }}
+        {%- elif this.state not in ['unknown', 'unavailable', none] %}{{ this.state }}
+        {%- else %}None{% endif %}
       availability: *proxy_availability
       device: *charger_device
 
