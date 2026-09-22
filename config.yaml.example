@@ -118,3 +118,68 @@ buffers:
   # Exponential backoff starts at 2s and doubles until this maximum.
   # Default: 60
   max_backoff_seconds: 60
+
+# ------------------------------------------------------------------------------
+# OPTIONAL: Charger control — the proxy's own OCPP commands
+# ------------------------------------------------------------------------------
+# Everything above is transparent forwarding. This section is the one place
+# the proxy speaks OCPP itself: on a request published to
+#   ocpp/{charge_point_id}/command                (JSON, see README)
+#   ocpp/{charge_point_id}/command/current_limit  (a bare number of amps, or "clear")
+# it sends a SetChargingProfile (or one of a few companion Calls) to the
+# CHARGER, consumes the charger's answer, and publishes the outcome on
+#   ocpp/{charge_point_id}/command/result
+# The Central System never sees any of it. Nothing is ever sent upstream.
+#
+# Off by default. Off, the proxy does not even subscribe to the command topics.
+charging:
+  enabled: false
+
+  # Ceiling on any limit the proxy will send. Requests above it are clamped
+  # and the result says so. Put it UNDER the site's contracted current, so a
+  # controller bug cannot ask the charger for more than the mains can give.
+  # A 6.9 kVA single-phase contract is 30 A in total, house included.
+  max_limit_a: 32
+
+  # An EV will not charge below 6 A (IEC 61851). A request below this is sent
+  # as 0 A, which pauses charging (SuspendedEVSE) with the transaction open.
+  min_limit_a: 6
+
+  # How the limit is installed on the charger.
+  #   connector_id 0  — the whole charge point (all connectors)
+  #   purpose         — TxDefaultProfile (widest support; applies to every
+  #                     transaction, yields to a TxProfile the Central System
+  #                     may install) or ChargePointMaxProfile (a true site
+  #                     limit, always wins; some chargers reject it — check
+  #                     SupportedFeatureProfiles with get_configuration first)
+  #   profile_kind    — Absolute (startSchedule = now; unambiguous) or Relative
+  #   rate_unit       — A, or W if ChargingScheduleAllowedChargingRateUnit is
+  #                     Power only (converted with nominal_voltage_v × phases)
+  #   number_phases   — 1 for a single-phase charger; null omits the field
+  connector_id: 0
+  profile_id: 1001
+  stack_level: 0
+  purpose: TxDefaultProfile
+  profile_kind: Absolute
+  rate_unit: A
+  number_phases: 1
+  nominal_voltage_v: 230
+
+  # A command that has not been sent, or not been answered, within this many
+  # seconds is reported as timed out.
+  command_timeout_seconds: 30
+
+  # When the charger (re)connects, re-send the last accepted limit. A charger
+  # that rebooted may have forgotten its profiles; silence would mean full
+  # current.
+  reapply_on_connect: true
+
+  # Keys change_configuration may touch. Nothing that alters how the charger
+  # reaches or authorises with the Central System belongs here.
+  allowed_configuration_keys:
+    - MeterValueSampleInterval
+    - MeterValuesSampledData
+    - ClockAlignedDataInterval
+    - MeterValuesAlignedData
+    - StopTxnSampledData
+    - StopTxnAlignedData

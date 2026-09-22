@@ -42,6 +42,45 @@ broker configuration is needed.
 | `sensor.charger_session_energy` | template | energy delivered this session |
 | `sensor.${CHARGE_POINT_SLUG}_ocpp_proxy_upstream` / `_downstream` | `status` | retained |
 | `binary_sensor.${CHARGE_POINT_SLUG}_ocpp_proxy_online` | `availability` | driven by the MQTT Last Will |
+| `number.${CHARGE_POINT_SLUG}_charger_current_limit` | `state` ← / → `command/current_limit` | the charging-current limit, A; 0 pauses |
+| `sensor.${CHARGE_POINT_SLUG}_charger_current_limit_status` | `state` | accepted / rejected / error / timeout / none |
+| `sensor.${CHARGE_POINT_SLUG}_charger_current_offered` | `charger/MeterValues` | `Current.Offered`, if the charger reports it |
+| `sensor.${CHARGE_POINT_SLUG}_charger_last_command` | `command/result` | status; the whole result as attributes |
+| `button.${CHARGE_POINT_SLUG}_charger_clear_current_limit` | → `command` | `clear_current_limit` |
+| `button.${CHARGE_POINT_SLUG}_charger_read_configuration` | → `command` | `get_configuration`; answer in the last-command attributes |
+| `button.${CHARGE_POINT_SLUG}_charger_read_applied_limit` | → `command` | `get_composite_schedule` |
+
+The control entities need the proxy deployed with `charging.enabled: true`
+(see the repository README, *Charger control*). Without it the number publishes
+into the void and the status sensor reads `none`, which is accurate.
+
+## Setting the charging current
+
+Move `number.${CHARGE_POINT_SLUG}_charger_current_limit`. The slider publishes
+the value to `ocpp/<id>/command/current_limit`; the proxy installs a
+`SetChargingProfile` on the charger and, once the charger has **accepted**,
+writes the limit into the retained snapshot, which is what the slider displays.
+So the slider is deliberately not optimistic: it shows what the charger took,
+and a moment's lag after moving it is normal. Ask for more than the proxy's
+`charging.max_limit_a` and the slider lands on the ceiling instead, with the
+`detail` attribute of the last-command sensor saying so.
+
+`0` pauses charging: the charger reports `SuspendedEVSE` and the transaction
+stays open with Mobi.e, so no re-authorisation is needed to resume. Values
+under 6 A are sent as 0 too — an EV will not charge below that, and asking
+would only confuse the car.
+
+The dashboard's *Charging limit* card shows the limit next to *Offered to the
+car* and *Actually drawn*, and a banner appears when the last limit command
+was not accepted, since the charger is then still applying the previous one.
+
+**Load balancing** belongs in an automation that moves this number from the
+mains meter: `available = (contracted_power − reserve − house_without_charger)
+/ 230 V`, clamped to a ceiling, and `0` when under 6 A. Reduce at once,
+raise only after a couple of minutes of spare headroom, and stop touching it
+when the house sensor is unavailable. The entity names for the meters are
+site-specific, so that package lives with the site's other Home Assistant
+packages rather than here.
 
 ## Energy dashboard
 
@@ -119,8 +158,8 @@ rather than showing a stale or zero figure.
 
 ## Testing the templates
 
-`render_check.py` renders every state-topic template against the payload shapes
-the broker actually serves — mid-session, after a session, a fresh snapshot, one
+`render_check.py` renders every state-topic template — the `number` included —
+against the payload shapes the broker actually serves — mid-session, after a session, a fresh snapshot, one
 where the proxy missed the StartTransaction, and the pre-change payload that has
 none of the `last_*` keys — and asserts both the state and the resolved
 availability for each:

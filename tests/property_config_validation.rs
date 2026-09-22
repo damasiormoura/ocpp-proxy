@@ -11,7 +11,9 @@
 use proptest::prelude::*;
 use tempfile::NamedTempFile;
 
-use ocpp_proxy::config::{BufferConfig, LogConfig, LogLevel, MqttConfig, ProxyConfig};
+use ocpp_proxy::config::{
+    BufferConfig, ChargingConfig, LogConfig, LogLevel, MqttConfig, ProxyConfig,
+};
 
 /// Helper to create a valid ProxyConfig using real temp files for TLS cert paths.
 fn valid_config_with_files(
@@ -40,6 +42,7 @@ fn valid_config_with_files(
         },
         buffers: BufferConfig::default(),
         state_file: String::new(),
+        charging: ChargingConfig::default(),
     }
 }
 
@@ -319,6 +322,7 @@ proptest! {
             },
             buffers: BufferConfig::default(),
             state_file: String::new(),
+            charging: ChargingConfig::default(),
         };
 
         let errors = config.validate();
@@ -410,6 +414,7 @@ proptest! {
             },
             buffers: BufferConfig::default(),
             state_file: String::new(),
+            charging: ChargingConfig::default(),
         };
 
         prop_assume!(listen_port != health_port);

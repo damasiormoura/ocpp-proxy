@@ -26,6 +26,8 @@ use proptest::prelude::*;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use ocpp_proxy::command::CommandRouter;
+use ocpp_proxy::config::ChargingConfig;
 use ocpp_proxy::downstream::{
     deregister_connection, register_connection, DownstreamState, OCPP16_SUBPROTOCOL,
 };
@@ -48,10 +50,12 @@ fn make_downstream_state() -> DownstreamState {
             max_backoff: Duration::from_millis(50),
             max_reconnect_window: Duration::from_millis(100),
             call_tracker_max_age: Duration::from_secs(300),
+            charging: ChargingConfig::default(),
         }),
         mqtt_tx,
         shutdown: CancellationToken::new(),
         generation: Arc::new(AtomicU64::new(1)),
+        command_router: CommandRouter::new(),
     }
 }
 
