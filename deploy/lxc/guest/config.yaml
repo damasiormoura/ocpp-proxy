@@ -91,13 +91,17 @@ buffers:
 #     or pauses". To lock it down, add an EMQX ACL denying publish on
 #     ocpp/+/command/# to all but the Home Assistant user.
 #
-#   * max_limit_a is a hard ceiling, not the working limit. It sits well under
-#     the 30 A a 6.9 kVA single-phase contract allows in total, so that even
-#     a controller asking for "everything" leaves 2.3 kW for the house. The
-#     working limit is whatever Home Assistant sets, dynamically or by hand.
+#   * max_limit_a is a hard ceiling, not the working limit. 28 A is the
+#     charger's own maximum (GetCompositeSchedule, 2026-09-22), so the ceiling
+#     no longer holds anything back: under a 6.9 kVA contract (30 A) a car
+#     drawing 28 A leaves 0.5 kW for the house. Keeping the house under the
+#     contract is the Home Assistant load-balancing package's job — its own
+#     ceiling (input_number.ev_charger_max_current_a, 20 A by default) and the
+#     headroom computed from the mains meter. Was 20 A from the first deploy
+#     until the owner raised it on 2026-09-22.
 charging:
   enabled: true
-  max_limit_a: 20
+  max_limit_a: 28
   min_limit_a: 6
   connector_id: 0
   purpose: TxDefaultProfile
