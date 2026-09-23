@@ -174,27 +174,22 @@ views:
             The charger is still applying the previous limit
             ({{ states('number.@CHARGE_POINT_SLUG@_charger_current_limit') }} A).
 
+      # The one place the limit appears. The slider IS the limit installed on
+      # the charger; the load balancer below moves this same slider.
       - type: entities
-        title: Charging limit
+        title: Limit on the charger
         state_color: true
         entities:
           - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
-            name: Current limit (0 = pause)
+            name: Limit (0 = pause)
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_limit_status
-            name: Last limit command
+            name: Charger's answer to the last limit
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_power_offered
             name: Offered to the car
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
             name: Actually drawn
           - entity: button.@CHARGE_POINT_SLUG@_charger_clear_current_limit
             name: Remove the limit
-          - type: divider
-          - entity: sensor.@CHARGE_POINT_SLUG@_charger_last_command
-            name: Last command result
-          - entity: button.@CHARGE_POINT_SLUG@_charger_read_configuration
-            name: Read charger configuration
-          - entity: button.@CHARGE_POINT_SLUG@_charger_read_applied_limit
-            name: Read applied schedule
 
       # ---------------------------------------------------------------
       # Load balancing
@@ -234,9 +229,11 @@ views:
               green: 0
               yellow: 4000
               red: 5500
+          # What the balancer wants the limit above to be. The two differ by up
+          # to 1 A on purpose (the restore step's dead band).
           - type: gauge
             entity: sensor.ev_available_current
-            name: Available for the car
+            name: Target for the car
             unit: A
             min: 0
             max: 32
@@ -253,7 +250,7 @@ views:
           - entity: input_boolean.ev_load_balancing
             name: Balancing active
           - entity: sensor.ev_available_current
-            name: Current available for the car
+            name: Target for the car (computed from the mains)
           - type: attribute
             entity: sensor.ev_available_current
             attribute: headroom_w
@@ -273,8 +270,6 @@ views:
             attribute: power_factor
             name: Power factor
             icon: mdi:sine-wave
-          - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
-            name: Limit on the charger now
           - type: divider
           - entity: input_number.ev_contracted_power_va
             name: Contracted power
@@ -296,17 +291,22 @@ views:
             secondary_info: last-triggered
 
       - type: history-graph
-        title: Balancing — house, available, limit, drawn (last 6 hours)
+        title: Target vs limit vs drawn (last 6 hours)
         hours_to_show: 6
         entities:
-          - entity: sensor.house_power_excluding_charger
-            name: House VA
           - entity: sensor.ev_available_current
-            name: Available A
+            name: Target A
           - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
             name: Limit A
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
             name: Drawn A
+
+      - type: history-graph
+        title: House load, apparent (last 6 hours)
+        hours_to_show: 6
+        entities:
+          - entity: sensor.house_power_excluding_charger
+            name: House VA
 
       # ---------------------------------------------------------------
       # Trends
@@ -317,15 +317,6 @@ views:
         entities:
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_power
             name: Power
-
-      - type: history-graph
-        title: Current — limit vs drawn (last 6 hours)
-        hours_to_show: 6
-        entities:
-          - entity: number.@CHARGE_POINT_SLUG@_charger_current_limit
-            name: Limit
-          - entity: sensor.@CHARGE_POINT_SLUG@_charger_current_l1
-            name: Drawn
 
       - type: history-graph
         title: Charger state
@@ -358,6 +349,16 @@ views:
             name: Current L1
           - entity: sensor.@CHARGE_POINT_SLUG@_charger_power
             name: Active power
+
+      - type: entities
+        title: Charger diagnostics
+        entities:
+          - entity: sensor.@CHARGE_POINT_SLUG@_charger_last_command
+            name: Last command result
+          - entity: button.@CHARGE_POINT_SLUG@_charger_read_configuration
+            name: Read charger configuration
+          - entity: button.@CHARGE_POINT_SLUG@_charger_read_applied_limit
+            name: Read applied schedule
 
       - type: entities
         title: Proxy link
